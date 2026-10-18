@@ -1,0 +1,11 @@
+# Build context: the gateway's sources, the client module and the licence files.
+.git
+bin
+sbi-gateway
+*.out
+coverage.html
+firebase-debug.log
+docs
+specs
+deploy
+shapes

@@ -1,0 +1,149 @@
+# Default values for sbi-ha-gateway.
+# 5G SBI HA Gateway — 3GPP HTTP/2 (Nudm/Nudr) ↔ NATS bridge. Stateless; horizontal scaling.
+
+replicaCount: 2
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Allowlisted registry (Contract §8.1 — no scheme, private IP or localhost).
+  registry: ghcr.io
+  repository: 3eai-labs/sbi-ha-gateway
+  # Overrides the image tag; defaults to the chart appVersion when empty. Never "latest".
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+# PSA `restricted`: non-root, RuntimeDefault seccomp, no privilege escalation, all
+# capabilities dropped. 65532 is the distroless image's nonroot user.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  sbiPort: 80        # external port → targetPort SBI (config.server.sbiPort)
+  adminPort: 9090    # metrics + health
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+# -- Application configuration (rendered to env; mirrors internal/config/config.go) --
+config:
+  server:
+    sbiPort: "8080"
+    adminPort: "9090"
+  logLevel: info            # debug | info | warn | error
+
+  nats:
+    # The NATS your applications use. Empty: the chart deploys its own NATS (see nats: below),
+    # for a trial install only — no application is connected to it.
+    url: ""
+    connectTimeout: "5s"
+    requestTimeout: "2s"
+
+  retry:
+    maxRetries: 3
+    baseDelay: "1s"
+
+  # Per-client token bucket in front of the back end. rps=0 disables the limiter.
+  rateLimit:
+    rps: 0
+    burst: 100
+
+  # TLS/mTLS (TS 33.310). Empty cert/key ⇒ h2c cleartext HTTP/2 for internal mesh.
+  # Cert material is mounted from tls.existingSecret (never inline).
+  tls:
+    certFile: ""
+    keyFile: ""
+  mtls:
+    clientCAFile: ""
+    clientAuthMode: "off"   # off | optional | require
+    outboundCertFile: ""
+    outboundKeyFile: ""
+    outboundCAFile: ""
+
+  # OAuth2 NF tokens (TS 33.501 §13.4.1). Disabled by default — opt in.
+  oauth:
+    disabled: true
+    audience: ""
+    nrfJwksUrl: ""
+    jwksFile: ""
+    jwksRefresh: "5m"
+    clockSkew: "30s"
+    resultCacheTTL: "60s"
+    requireCertBinding: false
+
+  # Delivery of data-change notifications: sbi_direct | scef_rest.
+  outbound:
+    profile: "sbi_direct"
+
+  # SMS (OTA) surfaces: serving-SMSF lookup and Nsmsf SendSMS. Off until opted in; needs
+  # config.nats.url (the stream OTA_OUTBOUND lives on the applications' NATS).
+  ota:
+    enabled: false
+    resolverFile: ""
+    uecmTimeout: "3s"
+
+  # Audit of state-changing operations. Subject may be tenant-prefixed for multi-tenant clusters.
+  audit:
+    disabled: false
+    natsSubject: "audit.events"
+
+# -- TLS secret (operator-provisioned; mounted at /etc/sbi-gateway/tls when set) --
+tls:
+  # Name of a pre-created Secret holding tls.crt / tls.key / ca.crt. Empty ⇒ h2c.
+  existingSecret: ""
+  mountPath: /etc/sbi-gateway/tls
+
+# Bundled NATS, used only when config.nats.url is empty: a single-replica, core-only NATS
+# (no JetStream, no storage) so that an install with the chart's defaults starts and becomes
+# Ready, as Arinna's onboarding render and smoke install do. NOT for production: there the
+# gateway must reach the applications' NATS, so set config.nats.url to it. With a URL set,
+# nothing below is deployed. With nats.deploy=false and no URL the chart refuses to render.
+nats:
+  deploy: true
+  image: docker.io/library/nats:2.10-alpine
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

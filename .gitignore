@@ -1,0 +1,27 @@
+# Binaries (anchor to repo root so cmd/sbi-gateway/ source dir is NOT matched)
+/sbi-gateway
+/bin/sbi-gateway
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+firebase-debug.log

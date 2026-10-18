@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}
+  labels:
+    {{- include "sbi-ha-gateway.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: sbi
+      port: {{ .Values.service.sbiPort | int }}
+      targetPort: sbi
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.service.adminPort | int }}
+      targetPort: admin
+      protocol: TCP
+  selector:
+    {{- include "sbi-ha-gateway.selectorLabels" . | nindent 4 }}

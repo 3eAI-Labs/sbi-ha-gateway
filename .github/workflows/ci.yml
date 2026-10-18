@@ -1,0 +1,79 @@
+name: CI
+
+# Runs here and in the public mirror (it is on the export allowlist): it proves the published
+# tree builds and passes its tests. No untrusted event inputs are interpolated into shell
+# commands, and no job pushes anything or reads a secret.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests + vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test (race)
+        run: go test -race -count=1 -timeout 5m ./...
+
+  licenses:
+    name: Licence headers + dependency licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check licences
+        # SPDX header on every source file; third-party dependencies permissive or MPL-2.0
+        # (AGPL-compatible, and keeps a commercial licence possible); client module, when
+        # present, permissive-only and free of gateway imports.
+        run: scripts/check-licenses.sh
+
+  static:
+    name: Static analysis
+    # Tools are pinned and built with go.mod's Go version: a linter built with an older Go
+    # refuses the module, and gosec built with a newer one skips its SSA checks.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: golangci-lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.5.0 run --timeout 5m ./...
+      - name: gosec
+        if: ${{ !cancelled() }}
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.22.8 ./...
+      - name: govulncheck
+        if: ${{ !cancelled() }}
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  image:
+    name: Container image
+    # The image is otherwise built only by the release workflow, on a tag: a broken Dockerfile
+    # or base image would surface there. Same commands as `make image-smoke`, so a failure here
+    # reproduces locally.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: make image
+      - name: Smoke test
+        run: scripts/image-smoke.sh sbi-ha-gateway:dev

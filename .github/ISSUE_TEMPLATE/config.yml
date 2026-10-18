@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/3eAI-Labs/sbi-ha-gateway/security/advisories/new
+    about: Report privately — do not open a public issue.
+  - name: Go client (NATS wire contract)
+    url: https://github.com/3eAI-Labs/sbi-ha-gateway-client/issues
+    about: Issues with the Go client or the message schema belong there.

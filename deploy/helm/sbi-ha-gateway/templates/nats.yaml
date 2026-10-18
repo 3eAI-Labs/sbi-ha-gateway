@@ -1,0 +1,93 @@
+{{- if include "sbi-ha-gateway.natsBundled" . -}}
+# Bundled NATS for an install with the chart's defaults (values.yaml, nats:). Core NATS only:
+# the gateway uses request/reply and queue groups, no JetStream, so nothing is stored.
+# NOT for production; set config.nats.url to the applications' NATS instead.
+# It has no authentication (the gateway's NATS settings carry a URL only), so the NetworkPolicy
+# below admits only this release's gateway pods; the probes run inside the pod so the policy does
+# not depend on how the CNI treats kubelet traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}-nats
+  labels:
+    {{- include "sbi-ha-gateway.natsLabels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "sbi-ha-gateway.natsSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}-nats
+  labels:
+    {{- include "sbi-ha-gateway.natsLabels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "sbi-ha-gateway.natsSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbi-ha-gateway.natsLabels" . | nindent 8 }}
+    spec:
+      # PSA `restricted`, fixed rather than values-driven: the smoke sandbox enforces it. The
+      # nats image runs as root by default, hence the explicit uid.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nats
+          image: {{ .Values.nats.image | quote }}
+          args: ["--port", "4222", "--http_port", "8222"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: client
+              containerPort: 4222
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          {{- with .Values.nats.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}-nats
+  labels:
+    {{- include "sbi-ha-gateway.natsLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbi-ha-gateway.natsSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "sbi-ha-gateway.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: client
+          protocol: TCP
+{{- end }}

@@ -1,0 +1,138 @@
+{{- if and .Values.config.ota.enabled (include "sbi-ha-gateway.natsBundled" .) -}}
+{{- fail "config.ota.enabled needs config.nats.url: the SMS stream OTA_OUTBOUND is on the applications' NATS, and the bundled NATS has no JetStream." -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}
+  labels:
+    {{- include "sbi-ha-gateway.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "sbi-ha-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+      labels:
+        {{- include "sbi-ha-gateway.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sbi-ha-gateway.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.config.server.sbiPort | int }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.config.server.adminPort | int }}
+              protocol: TCP
+          env:
+            # Server
+            - name: SBI_PORT
+              value: {{ .Values.config.server.sbiPort | quote }}
+            - name: ADMIN_PORT
+              value: {{ .Values.config.server.adminPort | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            # NATS: config.nats.url, or the bundled NATS when it is empty
+            - name: NATS_URL
+              value: {{ include "sbi-ha-gateway.natsURL" . | quote }}
+            - name: NATS_CONNECT_TIMEOUT
+              value: {{ .Values.config.nats.connectTimeout | quote }}
+            - name: NATS_REQUEST_TIMEOUT
+              value: {{ .Values.config.nats.requestTimeout | quote }}
+            # Retry
+            - name: MAX_RETRIES
+              value: {{ .Values.config.retry.maxRetries | quote }}
+            - name: RETRY_BASE_DELAY
+              value: {{ .Values.config.retry.baseDelay | quote }}
+            # Rate limiting
+            - name: RATE_LIMIT_RPS
+              value: {{ .Values.config.rateLimit.rps | quote }}
+            - name: RATE_LIMIT_BURST
+              value: {{ .Values.config.rateLimit.burst | quote }}
+            # OAuth2 NF tokens
+            - name: OAUTH_DISABLED
+              value: {{ .Values.config.oauth.disabled | quote }}
+            - name: OAUTH_AUDIENCE
+              value: {{ .Values.config.oauth.audience | quote }}
+            - name: OAUTH_NRF_JWKS_URL
+              value: {{ .Values.config.oauth.nrfJwksUrl | quote }}
+            - name: OAUTH_JWKS_FILE
+              value: {{ .Values.config.oauth.jwksFile | quote }}
+            - name: OAUTH_JWKS_REFRESH
+              value: {{ .Values.config.oauth.jwksRefresh | quote }}
+            - name: OAUTH_CLOCK_SKEW
+              value: {{ .Values.config.oauth.clockSkew | quote }}
+            - name: OAUTH_RESULT_CACHE_TTL
+              value: {{ .Values.config.oauth.resultCacheTTL | quote }}
+            - name: OAUTH_REQUIRE_CERT_BINDING
+              value: {{ .Values.config.oauth.requireCertBinding | quote }}
+            # Outbound / OTA / Audit
+            - name: OUTBOUND_PROFILE
+              value: {{ .Values.config.outbound.profile | quote }}
+            - name: OTA_ENABLED
+              value: {{ .Values.config.ota.enabled | quote }}
+            - name: OTA_RESOLVER_FILE
+              value: {{ .Values.config.ota.resolverFile | quote }}
+            - name: OTA_UECM_TIMEOUT
+              value: {{ .Values.config.ota.uecmTimeout | quote }}
+            - name: AUDIT_DISABLED
+              value: {{ .Values.config.audit.disabled | quote }}
+            - name: AUDIT_NATS_SUBJECT
+              value: {{ .Values.config.audit.natsSubject | quote }}
+            {{- if .Values.tls.existingSecret }}
+            # TLS/mTLS — cert material mounted from tls.existingSecret
+            - name: TLS_CERT_FILE
+              value: "{{ .Values.tls.mountPath }}/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "{{ .Values.tls.mountPath }}/tls.key"
+            {{- if .Values.config.mtls.clientCAFile }}
+            - name: MTLS_CLIENT_CA_FILE
+              value: "{{ .Values.tls.mountPath }}/ca.crt"
+            {{- end }}
+            - name: MTLS_CLIENT_AUTH_MODE
+              value: {{ .Values.config.mtls.clientAuthMode | quote }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.tls.existingSecret }}
+          volumeMounts:
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+          {{- end }}
+      {{- if .Values.tls.existingSecret }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+            defaultMode: 0400
+      {{- end }}

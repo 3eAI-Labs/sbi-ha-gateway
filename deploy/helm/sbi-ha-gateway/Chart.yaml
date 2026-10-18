@@ -1,0 +1,38 @@
+apiVersion: v2
+name: sbi-ha-gateway
+description: >-
+  5G service-based interface gateway: serves Nudm (UEAU, UECM, SDM, MT, PP, EE)
+  and Nudr over HTTP/2 and hands each request to an application over NATS.
+  Keeps no subscriber state; replicas share the load through NATS queue groups.
+  Arinna-onboardable per the Product Packaging Contract v2.0 (chart-only intake).
+type: application
+
+# Chart version — bump independently of the application (SemVer). A published version is
+# never re-pushed: any change, including a new appVersion, is a new chart version.
+version: 0.2.0
+
+# Application version — the sbi-gateway binary this chart deploys. Releases go to
+# ghcr.io/3eai-labs/sbi-ha-gateway:<appVersion>; 1.0.0 was published to registry.3eai-labs.com only.
+appVersion: "0.2.0"
+
+keywords:
+  - 5g
+  - sbi
+  - nudm
+  - nudr
+  - gateway
+  - nats
+  - telco
+home: https://www.3eai-labs.com
+sources:
+  - https://github.com/3eAI-Labs/sbi-ha-gateway
+maintainers:
+  - name: 3eAI Labs — Telco
+    url: https://github.com/3eAI-Labs
+
+annotations:
+  # Catalog category, declared by the product; Arinna reads it at onboarding.
+  arinna.3eai-labs.com/category: signaling
+  arinna.3eai-labs.com/packaging-contract: "v2.0"
+  arinna.3eai-labs.com/intake: "chart-only"
+  arinna.3eai-labs.com/day2-model: "rolling-restart"
