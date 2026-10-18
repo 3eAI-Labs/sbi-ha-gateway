@@ -144,6 +144,11 @@
       }
     },
 
+    "terminationGracePeriodSeconds": {
+      "type": "integer", "minimum": 1,
+      "description": "Time the kubelet allows the gateway after SIGTERM. Must exceed config.shutdown.drainDelay plus the 5 s shutdown."
+    },
+
     "config": {
       "type": "object",
       "additionalProperties": false,
@@ -188,6 +193,16 @@
             "baseDelay": {
               "type": "string", "pattern": "^[1-9][0-9]*(ms|s|m|h)$",
               "description": "Wait after the first failed pass; doubles after each further one. Must be positive."
+            }
+          }
+        },
+        "shutdown": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "drainDelay": {
+              "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$",
+              "description": "After SIGTERM the gateway serves on this long, answering not ready, before it stops listening. Plus the 5 s shutdown, it must stay below terminationGracePeriodSeconds. 0s closes at once."
             }
           }
         },

@@ -48,6 +48,10 @@ type Config struct {
 	MaxRetries     int
 	RetryBaseDelay time.Duration
 
+	// ShutdownDrainDelay is how long the SBI port keeps serving after SIGTERM, answering not
+	// ready meanwhile, before it stops accepting connections.
+	ShutdownDrainDelay time.Duration
+
 	// Rate Limiting (per NF Instance ID, falls back to remote IP)
 	RateLimitRPS   float64
 	RateLimitBurst int
@@ -122,6 +126,9 @@ func Load() *Config {
 		// Retry
 		MaxRetries:     getIntEnv("MAX_RETRIES", 3),
 		RetryBaseDelay: getDurationEnv("RETRY_BASE_DELAY", 1*time.Second),
+
+		// Shutdown
+		ShutdownDrainDelay: getDurationEnv("SHUTDOWN_DRAIN_DELAY", 5*time.Second),
 
 		// Rate limiting (0 RPS disables it)
 		RateLimitRPS:   getFloatEnv("RATE_LIMIT_RPS", 0),

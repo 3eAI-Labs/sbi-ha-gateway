@@ -6,6 +6,7 @@ package admin
 import (
 	"encoding/json"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/nats"
@@ -15,10 +16,18 @@ import (
 
 type AdminServer struct {
 	Nats nats.INatsClient
+
+	draining atomic.Bool
 }
 
 func NewAdminServer(nc nats.INatsClient) *AdminServer {
 	return &AdminServer{Nats: nc}
+}
+
+// Drain makes the readiness probe fail from now on: the gateway is shutting down and
+// still serves while whatever routes to it learns that it should stop.
+func (s *AdminServer) Drain() {
+	s.draining.Store(true)
 }
 
 func (s *AdminServer) SetupRouter() *chi.Mux {
@@ -33,7 +42,7 @@ func (s *AdminServer) SetupRouter() *chi.Mux {
 	})
 
 	r.Get("/health/ready", func(w http.ResponseWriter, r *http.Request) {
-		if s.Nats != nil && s.Nats.IsConnected() {
+		if !s.draining.Load() && s.Nats != nil && s.Nats.IsConnected() {
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)

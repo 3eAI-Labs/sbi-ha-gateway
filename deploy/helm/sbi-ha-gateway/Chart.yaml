@@ -9,11 +9,11 @@ type: application
 
 # Chart version — bump independently of the application (SemVer). A published version is
 # never re-pushed: any change, including a new appVersion, is a new chart version.
-version: 0.2.0
+version: 0.2.1
 
 # Application version — the sbi-gateway binary this chart deploys. Releases go to
 # ghcr.io/3eai-labs/sbi-ha-gateway:<appVersion>; 1.0.0 was published to registry.3eai-labs.com only.
-appVersion: "0.2.0"
+appVersion: "0.2.1"
 
 keywords:
   - 5g

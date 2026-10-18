@@ -70,6 +70,25 @@ func TestAdminServer_HealthReady_Disconnected(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 }
 
+// A draining gateway is not ready even though NATS is connected, and still alive.
+func TestAdminServer_HealthReady_Draining(t *testing.T) {
+	mockNats := new(MockNatsClient)
+	mockNats.On("IsConnected").Return(true)
+	srv := admin.NewAdminServer(mockNats)
+	r := srv.SetupRouter()
+
+	srv.Drain()
+
+	for path, want := range map[string]int{
+		"/health/ready": http.StatusServiceUnavailable,
+		"/health/live":  http.StatusOK,
+	} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, want, w.Code, path)
+	}
+}
+
 func TestAdminServer_Stats(t *testing.T) {
 	mockNats := new(MockNatsClient)
 	mockNats.On("IsConnected").Return(true)

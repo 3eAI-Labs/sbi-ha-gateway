@@ -26,6 +26,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "sbi-ha-gateway.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -61,6 +62,9 @@ spec:
               value: {{ .Values.config.retry.maxRetries | quote }}
             - name: RETRY_BASE_DELAY
               value: {{ .Values.config.retry.baseDelay | quote }}
+            # Shutdown
+            - name: SHUTDOWN_DRAIN_DELAY
+              value: {{ .Values.config.shutdown.drainDelay | quote }}
             # Rate limiting
             - name: RATE_LIMIT_RPS
               value: {{ .Values.config.rateLimit.rps | quote }}

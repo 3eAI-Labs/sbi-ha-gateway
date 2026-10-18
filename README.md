@@ -9,7 +9,7 @@ SMS platform.
 The gateway keeps no subscriber state. Replicas share the work through NATS queue groups and a
 JetStream work queue, so it scales horizontally.
 
-**Status: 0.2.0, the first public release.** It has not carried traffic on a production network.
+**Status: 0.2.1; 0.2.0 was the first public release.** It has not carried traffic on a production network.
 Read [Known limitations](#known-limitations) before relying on it.
 
 ## How it works
@@ -99,7 +99,7 @@ The gateway is configured through environment variables only (below) and needs a
 ### Helm
 
 ```bash
-helm install sbi oci://ghcr.io/3eai-labs/charts/sbi-ha-gateway --version 0.2.0 \
+helm install sbi oci://ghcr.io/3eai-labs/charts/sbi-ha-gateway --version 0.2.1 \
   --set config.nats.url=nats://nats.example:4222
 ```
 
@@ -137,14 +137,16 @@ Pod Security Standard. `values.schema.json` documents every value.
 | `OTA_UECM_TIMEOUT` | `3s` | Time budget of one serving-SMSF lookup |
 | `AUDIT_DISABLED` | `false` | Audit events for state-changing operations, with SUPIs masked and key material redacted |
 | `AUDIT_NATS_SUBJECT` | `audit.events` | Subject of the audit events |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. A line per request is `debug`, a 5xx `warn`; it names the route, not the URI with its SUPI |
 | `MAX_RETRIES` | `3` | Passes over a notification's callback URIs, the first included, before it is dropped |
 | `RETRY_BASE_DELAY` | `1s` | Wait after the first failed pass; it doubles after each further one |
+| `SHUTDOWN_DRAIN_DELAY` | `5s` | After SIGTERM the SBI port goes on serving this long, `/health/ready` answering 503, before it closes; `0` closes at once |
 
 Invalid settings stop the gateway at start-up rather than weakening it or running otherwise than
 asked: OAuth on without an audience or a JWKS source, `require` without a CA file, a certificate
 without its key (or the reverse), client-certificate settings without TLS, an incomplete outbound
-certificate, an unknown `OUTBOUND_PROFILE` or `LOG_LEVEL`, `MAX_RETRIES` below 1.
+certificate, an unknown `OUTBOUND_PROFILE` or `LOG_LEVEL`, `MAX_RETRIES` below 1, a negative
+`SHUTDOWN_DRAIN_DELAY`.
 
 The SBI port drops a connection whose request headers take over 10 s, limits each stream to 30 s of
 reading and to the NATS request timeout plus 10 s (at least 30 s) of writing, closes connections idle
@@ -159,7 +161,7 @@ otherwise. Logs are JSON on standard output.
 
 ## Known limitations
 
-These are open in 0.2.0.
+These are open in 0.2.1.
 
 - **Not all of TS 29.503 is served.** Among the operations the table above does not list: AMF and
   SMSF registrations for non-3GPP access, the UECM custom operations (dereg-amf, pei-update,

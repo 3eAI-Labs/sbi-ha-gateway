@@ -21,7 +21,7 @@ func unsetConfigEnv(t *testing.T) {
 		OAUTH_CLOCK_SKEW OAUTH_DISABLED OAUTH_JWKS_FILE OAUTH_JWKS_REFRESH OAUTH_NRF_JWKS_URL
 		OAUTH_REQUIRE_CERT_BINDING OAUTH_RESULT_CACHE_TTL OTA_ENABLED OTA_RESOLVER_FILE
 		OTA_UECM_TIMEOUT OUTBOUND_PROFILE RATE_LIMIT_BURST RATE_LIMIT_RPS RETRY_BASE_DELAY
-		SBI_PORT TLS_CERT_FILE TLS_KEY_FILE`) {
+		SBI_PORT SHUTDOWN_DRAIN_DELAY TLS_CERT_FILE TLS_KEY_FILE`) {
 		t.Setenv(k, "")
 	}
 }
@@ -39,6 +39,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "info", cfg.LogLevel)
 	assert.Equal(t, 3, cfg.MaxRetries)
 	assert.Equal(t, 1*time.Second, cfg.RetryBaseDelay)
+	assert.Equal(t, 5*time.Second, cfg.ShutdownDrainDelay)
 }
 
 func TestLoad_FromEnv(t *testing.T) {
@@ -48,6 +49,7 @@ func TestLoad_FromEnv(t *testing.T) {
 	t.Setenv("NATS_REQUEST_TIMEOUT", "5s")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("MAX_RETRIES", "5")
+	t.Setenv("SHUTDOWN_DRAIN_DELAY", "0s")
 
 	cfg := Load()
 
@@ -57,6 +59,7 @@ func TestLoad_FromEnv(t *testing.T) {
 	assert.Equal(t, 5*time.Second, cfg.NatsRequestTimeout)
 	assert.Equal(t, "debug", cfg.LogLevel)
 	assert.Equal(t, 5, cfg.MaxRetries)
+	assert.Equal(t, time.Duration(0), cfg.ShutdownDrainDelay)
 }
 
 func TestGetIntEnv_InvalidValue(t *testing.T) {

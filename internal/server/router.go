@@ -4,6 +4,8 @@
 package server
 
 import (
+	"log/slog"
+
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/oauth"
 	"github.com/go-chi/chi/v5"
@@ -22,12 +24,19 @@ type RouterConfig struct {
 	// RateLimitRPS sets the per-NF token-bucket refill rate. 0 disables limiting.
 	RateLimitRPS   float64
 	RateLimitBurst int
+
+	// Logger receives the access lines; nil means slog.Default().
+	Logger *slog.Logger
 }
 
 func NewRouter(cfg RouterConfig) *chi.Mux {
 	r := chi.NewRouter()
 
-	RegisterMiddleware(r)
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	RegisterMiddleware(r, log)
 	// PeerIdentityMiddleware MUST run before OAuth so the validator can
 	// read the peer cert thumbprint for RFC 8705 binding. h2c / non-mTLS
 	// connections result in a no-op — chain stays correct in both modes.

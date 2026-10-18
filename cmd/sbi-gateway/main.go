@@ -65,6 +65,9 @@ func RunWithContext(ctx context.Context) error {
 		return fmt.Errorf("MAX_RETRIES (%d) must be at least 1 and RETRY_BASE_DELAY (%s) positive",
 			cfg.MaxRetries, cfg.RetryBaseDelay)
 	}
+	if cfg.ShutdownDrainDelay < 0 {
+		return fmt.Errorf("SHUTDOWN_DRAIN_DELAY (%s) must not be negative", cfg.ShutdownDrainDelay)
+	}
 	log.Info("Starting SBI HA Gateway...",
 		slog.String("sbi_port", cfg.SBIPort),
 		slog.String("admin_port", cfg.AdminPort),
@@ -121,6 +124,7 @@ func RunWithContext(ctx context.Context) error {
 		OAuthValidator: oauthValidator,
 		RateLimitRPS:   cfg.RateLimitRPS,
 		RateLimitBurst: cfg.RateLimitBurst,
+		Logger:         log,
 	})
 
 	// 4.1 Build outbound HTTP/2 client. mTLS config is fatal-on-partial
@@ -193,7 +197,8 @@ func RunWithContext(ctx context.Context) error {
 	}
 
 	// 5. Start Admin Server
-	adminHTTPSrv := admin.NewAdminServer(nc).HTTPServer(":" + cfg.AdminPort)
+	adminSrv := admin.NewAdminServer(nc)
+	adminHTTPSrv := adminSrv.HTTPServer(":" + cfg.AdminPort)
 	go func() {
 		log.Info("Admin server starting", slog.String("port", cfg.AdminPort))
 		if err := adminHTTPSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -239,7 +244,13 @@ func RunWithContext(ctx context.Context) error {
 	// 7. Wait for shutdown signal via context
 	<-ctx.Done()
 
-	log.Info("Shutting down gracefully...")
+	// A terminating pod leaves the Service's endpoints, but kube-proxy and any balancer in
+	// front route to it for a moment longer: closing the listener now would refuse those
+	// connections. Serve on for the drain delay, answering not ready meanwhile.
+	log.Info("Shutting down gracefully...", slog.Duration("drain_delay", cfg.ShutdownDrainDelay))
+	adminSrv.Drain()
+	time.Sleep(cfg.ShutdownDrainDelay)
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

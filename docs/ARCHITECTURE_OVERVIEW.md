@@ -27,7 +27,8 @@ gateway imports it; it never imports the gateway.
 
 1. The SBI port accepts HTTP/2 (Go's `net/http`): TLS 1.3 with ALPN `h2` when a certificate and key
    are configured, cleartext h2c with prior knowledge otherwise; HTTP/1.1 is accepted too.
-2. The middleware chain runs in this order: request ID, access log, panic recovery, metrics; then
+2. The middleware chain runs in this order: request ID, access log (JSON through the same logger,
+   naming the route pattern rather than the URI), panic recovery, metrics; then
    **peer identity** (the NF instance ID from the client certificate's URI
    SAN, and the certificate's SHA-256 thumbprint); then **OAuth2** (when enabled: the bearer token
    is validated and, if it carries a `cnf` claim, bound to that thumbprint); then the **rate
@@ -79,4 +80,6 @@ rate-limit buckets (so the effective limit grows with the replica count) and its
 - The gateway starts even when NATS is unreachable and keeps reconnecting; `/health/ready` stays
   503 until the connection is up. With `OTA_ENABLED` it exits instead, because the SendSMS consumer
   cannot be created.
-- On SIGTERM it stops the NATS subscribers, then shuts both HTTP servers down with a 5 s limit.
+- On SIGTERM it first goes on serving for `SHUTDOWN_DRAIN_DELAY` (5 s) with `/health/ready` at 503,
+  so connections that kube-proxy or a balancer still sends to the terminating pod are answered;
+  then it stops the NATS subscribers and shuts both HTTP servers down with a 5 s limit.

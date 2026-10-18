@@ -5,6 +5,9 @@ package main
 
 import (
 	"context"
+	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +41,7 @@ func TestRunWithContext(t *testing.T) {
 	t.Setenv("NATS_URL", s.ClientURL())
 	t.Setenv("SBI_PORT", "0")
 	t.Setenv("ADMIN_PORT", "0")
+	t.Setenv("SHUTDOWN_DRAIN_DELAY", "0s")
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -72,9 +76,10 @@ func TestRunWithContext_NatsFailure(t *testing.T) {
 // stop it at start-up.
 func TestRunWithContext_RejectsInvalidSettings(t *testing.T) {
 	for name, env := range map[string][2]string{
-		"unknown LOG_LEVEL":         {"LOG_LEVEL", "verbose"},
-		"MAX_RETRIES 0":             {"MAX_RETRIES", "0"},
-		"negative RETRY_BASE_DELAY": {"RETRY_BASE_DELAY", "-1s"},
+		"unknown LOG_LEVEL":             {"LOG_LEVEL", "verbose"},
+		"MAX_RETRIES 0":                 {"MAX_RETRIES", "0"},
+		"negative RETRY_BASE_DELAY":     {"RETRY_BASE_DELAY", "-1s"},
+		"negative SHUTDOWN_DRAIN_DELAY": {"SHUTDOWN_DRAIN_DELAY", "-1s"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(env[0], env[1])
@@ -85,6 +90,86 @@ func TestRunWithContext_RejectsInvalidSettings(t *testing.T) {
 				t.Fatalf("got %v, want an error naming %s", err, env[0])
 			}
 		})
+	}
+}
+
+// After the signal the SBI port goes on answering for SHUTDOWN_DRAIN_DELAY while the
+// readiness probe fails, so that connections still routed to a terminating pod are served;
+// only then does the gateway stop listening.
+func TestRunWithContext_DrainsBeforeClosing(t *testing.T) {
+	s := runServer(nil)
+	defer s.Shutdown()
+
+	sbiPort, adminPort := freePort(t), freePort(t)
+	t.Setenv("NATS_URL", s.ClientURL())
+	t.Setenv("SBI_PORT", sbiPort)
+	t.Setenv("ADMIN_PORT", adminPort)
+	t.Setenv("SHUTDOWN_DRAIN_DELAY", "1s")
+	ready := "http://127.0.0.1:" + adminPort + "/health/ready"
+	sbi := "http://127.0.0.1:" + sbiPort + "/nudm-sdm/v1/imsi-001010000000001/am-data"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- RunWithContext(ctx) }()
+
+	waitStatus(t, ready, http.StatusOK)
+	cancel()
+	signalled := time.Now()
+	waitStatus(t, ready, http.StatusServiceUnavailable)
+
+	// Any HTTP answer will do: no application is on NATS, so it is a 504.
+	if _, err := get(sbi); err != nil {
+		t.Fatalf("SBI port refused a request during the drain: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err)
+		assert.GreaterOrEqual(t, time.Since(signalled), time.Second, "stopped before the drain delay")
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown timeout")
+	}
+	if _, err := get(sbi); err == nil {
+		t.Error("SBI port still answers after shutdown")
+	}
+}
+
+// freePort returns a TCP port nothing listens on at the time of the call.
+func freePort(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	return strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+}
+
+// get makes one request on a connection of its own.
+func get(url string) (int, error) {
+	c := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := c.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+// waitStatus polls url until it answers want, for up to 5 seconds.
+func waitStatus(t *testing.T, url string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code, err := get(url)
+		if err == nil && code == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: got %d (%v), want %d", url, code, err, want)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

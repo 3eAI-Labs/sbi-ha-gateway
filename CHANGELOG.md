@@ -10,6 +10,39 @@ production network. Its entry describes what changed for an installation of 1.0.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-18
+
+Fixes found by installing 0.2.0 end to end on Kubernetes. The NATS contract is unchanged. Chart
+0.2.1 deploys 0.2.1 and adds `config.shutdown.drainDelay` and `terminationGracePeriodSeconds`; its
+other values are those of 0.2.0.
+
+### Fixed
+
+- **A rolling update or a scale-down no longer refuses connections.** On SIGTERM the gateway closed
+  its SBI port at once, while kube-proxy went on routing new connections to the terminating pod for a
+  moment: deleting a pod under load refused a new connection each time (on kind, one per deletion at
+  about 250 requests a second). The
+  gateway now goes on serving for `SHUTDOWN_DRAIN_DELAY` (default `5s`, chart
+  `config.shutdown.drainDelay`), `/health/ready` answering 503 meanwhile, and only then shuts down.
+  The chart sets `terminationGracePeriodSeconds` (default 30), which must exceed the drain delay
+  plus the 5 s shutdown.
+
+### Security
+
+- **Subscriber identifiers no longer reach the access log or the metrics.** The access log wrote the
+  request URI — the SUPI or GPSI in the path, the query — as a plain-text line per request on
+  standard output, outside `LOG_LEVEL`. It is now a JSON line through the gateway's logger that names
+  the route pattern (`/nudm-sdm/v1/{supi}/am-data`), the status, the size, the duration and the
+  request ID. A path no route matches is `unmatched` in the access log and in the
+  `path` label of `sbi_gateway_requests_total` and `sbi_gateway_request_duration_seconds`, where it
+  was the path: any client could add a time series per request.
+
+### Changed
+
+- The access line of a request is `debug`, of a 5xx `warn`: at the default `info` the gateway no
+  longer writes a line per request. A request whose handler writes no status counts as 200 in the
+  metrics, not 0.
+
 ## [0.2.0] — 2026-10-18
 
 ### Licensing and packaging

@@ -64,6 +64,10 @@ pdb:
   enabled: true
   minAvailable: 1
 
+# Longer than config.shutdown.drainDelay plus the 5 s shutdown, or the kubelet kills the gateway
+# with requests in flight.
+terminationGracePeriodSeconds: 30
+
 # -- Application configuration (rendered to env; mirrors internal/config/config.go) --
 config:
   server:
@@ -81,6 +85,12 @@ config:
   retry:
     maxRetries: 3
     baseDelay: "1s"
+
+  # After SIGTERM the gateway goes on serving this long, /health/ready answering 503, so that
+  # connections kube-proxy still sends to the terminating pod are answered. Drain delay plus the
+  # 5 s shutdown that follows must stay below terminationGracePeriodSeconds.
+  shutdown:
+    drainDelay: "5s"
 
   # Per-client token bucket in front of the back end. rps=0 disables the limiter.
   rateLimit:

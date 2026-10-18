@@ -33,13 +33,14 @@ func TestGetRoutePattern_ReturnsChiPattern(t *testing.T) {
 }
 
 func TestGetRoutePattern_NoChiContext(t *testing.T) {
-	// Request with no chi.RouteContext attached → falls back to URL path.
-	req := httptest.NewRequest(http.MethodGet, "/raw/path", nil)
-	assert.Equal(t, "/raw/path", getRoutePattern(req))
+	// Request with no chi.RouteContext attached → unmatchedRoute, never the path.
+	req := httptest.NewRequest(http.MethodGet, "/raw/imsi-001010000000001", nil)
+	assert.Equal(t, unmatchedRoute, getRoutePattern(req))
 }
 
 func TestGetRoutePattern_UnmatchedRoute(t *testing.T) {
-	// chi RouteContext exists but no matching route → empty pattern → URL path fallback.
+	// chi RouteContext exists but no matching route → empty pattern → unmatchedRoute: the
+	// path is the client's, and may carry a SUPI or a new metric label per request.
 	r := chi.NewRouter()
 	r.Get("/known", func(w http.ResponseWriter, _ *http.Request) {})
 
@@ -49,10 +50,10 @@ func TestGetRoutePattern_UnmatchedRoute(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/unmatched/path", nil)
+	req := httptest.NewRequest(http.MethodGet, "/nudm-xyz/v1/imsi-001010000000001", nil)
 	r.ServeHTTP(httptest.NewRecorder(), req)
 
-	assert.Equal(t, "/unmatched/path", captured)
+	assert.Equal(t, unmatchedRoute, captured)
 }
 
 func TestMetricsMiddleware_PassesThrough(t *testing.T) {
