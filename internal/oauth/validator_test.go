@@ -16,6 +16,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -440,5 +442,87 @@ func mustReason(t *testing.T, err error, want FailReason) {
 	}
 	if ve.Reason != want {
 		t.Fatalf("expected reason %q, got %q (err: %v)", want, ve.Reason, err)
+	}
+}
+
+// Readiness follows the keys: with OAuth on and no key from the NRF yet, every token is
+// rejected, so the gateway must not be ready (A.8).
+func TestReady_FollowsNRFKeys(t *testing.T) {
+	iss := newRSAIssuer(t, "k1")
+	var serve atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !serve.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(iss.publicSet)
+	}))
+	defer srv.Close()
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	down, err := New(context.Background(), Config{JWKS: JWKSConfig{NRFURL: srv.URL}, Audience: "amf.local"}, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Ready(down) {
+		t.Error("ready without a key")
+	}
+
+	serve.Store(true)
+	up, err := New(context.Background(), Config{JWKS: JWKSConfig{NRFURL: srv.URL}, Audience: "amf.local"}, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Ready(up) {
+		t.Error("not ready with the NRF's key")
+	}
+	if !Ready(newFileValidator(t, iss.publicSet, "amf.local")) {
+		t.Error("a JWKS file validator not ready")
+	}
+}
+
+// An NRF that accepts the connection and never answers holds start-up for the fetch timeout,
+// not indefinitely (0.2.x used http.DefaultClient, which has none).
+func TestJWKS_FetchTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release)
+	saved := jwksFetchTimeout
+	jwksFetchTimeout = 200 * time.Millisecond
+	defer func() { jwksFetchTimeout = saved }()
+
+	start := time.Now()
+	v, err := New(context.Background(), Config{JWKS: JWKSConfig{NRFURL: srv.URL}, Audience: "amf.local"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("start-up held %s by an NRF that does not answer", elapsed)
+	}
+	if Ready(v) {
+		t.Error("ready without a key")
+	}
+}
+
+// Short refresh intervals register: 0.2.x halved the interval into a refresh window, which
+// httprc replaces with 15 m under 1 s and then refuses, so OAUTH_JWKS_REFRESH below 2 s
+// stopped the gateway with an error about a window nobody set. Below 1 s is refused plainly.
+func TestJWKS_ShortRefreshInterval(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	defer srv.Close()
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, interval := range []time.Duration{time.Second, 1500 * time.Millisecond} {
+		if _, err := New(context.Background(), Config{JWKS: JWKSConfig{NRFURL: srv.URL, RefreshInterval: interval}, Audience: "a"}, quiet); err != nil {
+			t.Errorf("refresh %s: %v", interval, err)
+		}
+	}
+	_, err := New(context.Background(), Config{JWKS: JWKSConfig{NRFURL: srv.URL, RefreshInterval: 500 * time.Millisecond}, Audience: "a"}, quiet)
+	if err == nil || !strings.Contains(err.Error(), "OAUTH_JWKS_REFRESH") {
+		t.Errorf("refresh 500ms: %v, want an error naming OAUTH_JWKS_REFRESH", err)
 	}
 }

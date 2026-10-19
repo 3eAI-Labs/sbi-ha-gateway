@@ -11,6 +11,7 @@ import (
 // sensitiveKeys is the case-folded set of JSON field names we ALWAYS strip
 // before audit emission. List sources:
 //   - 3GPP TS 33.501 §6.1 (auth vector fields: RAND, AUTN, KAusf, KAmf, KSeaf, CK, IK, XRES*)
+//   - 3GPP TS 29.505 AuthenticationSubscription (subscriber keys and SQN)
 //   - RFC 6749 / OAuth (authorization, access_token, refresh_token)
 //   - RFC 6265 (cookie / set-cookie)
 //
@@ -49,6 +50,16 @@ var sensitiveKeys = map[string]struct{}{
 	"sk":            {},
 	"sucipriv":      {},
 	"privatekey":    {},
+	// TS 29.505 AuthenticationSubscription and SequenceNumber.
+	"encpermanentkey": {},
+	"permanentkey":    {},
+	"encopckey":       {},
+	"opckey":          {},
+	"encopkey":        {},
+	"enctopckey":      {},
+	"topckey":         {},
+	"sequencenumber":  {},
+	"sqn":             {},
 }
 
 const redactedMarker = "[REDACTED]"

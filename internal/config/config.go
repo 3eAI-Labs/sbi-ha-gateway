@@ -4,6 +4,9 @@
 package config
 
 import (
+	"errors"
+	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -30,6 +33,9 @@ type Config struct {
 	// Outbound (client-side) mTLS uses MTLSOutboundCertFile / KeyFile / CAFile;
 	// gateway presents OutboundCert to peer NFs and verifies their certs
 	// against OutboundCA. All three or none — partial config is fatal.
+	// AllowPlaintextSBI lets the SBI port serve cleartext h2c without TLS_CERT_FILE and
+	// TLS_KEY_FILE; without it the gateway refuses to start.
+	AllowPlaintextSBI    bool
 	MTLSClientCAFile     string
 	MTLSClientAuthMode   string
 	MTLSOutboundCertFile string
@@ -40,6 +46,15 @@ type Config struct {
 	NatsURL            string
 	NatsConnectTimeout time.Duration
 	NatsRequestTimeout time.Duration
+	// NATS authentication (at most one method; secrets as files) and TLS.
+	NatsCredsFile    string
+	NatsNkeySeedFile string
+	NatsUser         string
+	NatsPasswordFile string
+	NatsTokenFile    string
+	NatsTLSCAFile    string
+	NatsTLSCertFile  string
+	NatsTLSKeyFile   string
 
 	// Logging
 	LogLevel string
@@ -47,10 +62,15 @@ type Config struct {
 	// Retry Configuration
 	MaxRetries     int
 	RetryBaseDelay time.Duration
+	// NotifyWorkers is how many notifications are delivered at once.
+	NotifyWorkers int
 
 	// ShutdownDrainDelay is how long the SBI port keeps serving after SIGTERM, answering not
 	// ready meanwhile, before it stops accepting connections.
 	ShutdownDrainDelay time.Duration
+	// ShutdownTimeout bounds what follows the drain delay: requests in flight, notification
+	// deliveries and SMS being sent finish within it, side by side.
+	ShutdownTimeout time.Duration
 
 	// Rate Limiting (per NF Instance ID, falls back to remote IP)
 	RateLimitRPS   float64
@@ -75,7 +95,11 @@ type Config struct {
 	// when alternateCallbackUris is present); "scef_rest" causes the
 	// gateway to ack the NATS message and let an external SCEF adapter
 	// deliver. Invalid values are fatal at startup.
-	OutboundProfile string
+	// OutboundAllowedDestinations lists the hosts callbacks and SMSF calls may reach (host
+	// names, ".domain" suffixes, CIDRs, addresses); empty: none, unless OutboundAllowAny.
+	OutboundAllowedDestinations string
+	OutboundAllowAny            bool
+	OutboundProfile             string
 
 	// SMS (OTA) surfaces: serving-SMSF lookup and Nsmsf SendSMS. Disabled by
 	// default so existing deployments don't open the UECM/SMSF subjects
@@ -97,120 +121,153 @@ func (c *Config) TLSEnabled() bool {
 	return c.TLSCertFile != "" && c.TLSKeyFile != ""
 }
 
-// Load reads configuration from environment variables with defaults
-func Load() *Config {
-	return &Config{
+// Load reads configuration from environment variables with defaults. A value that does not
+// parse is an error, never its default: OAUTH_DISABLED=fasle leaving OAuth off, or
+// RATE_LIMIT_RPS=100/s switching the limiter off, is what this prevents. All such values
+// are reported at once.
+func Load() (*Config, error) {
+	var l loader
+	cfg := &Config{
 		// Server
-		SBIPort:   getEnv("SBI_PORT", "8080"),
-		AdminPort: getEnv("ADMIN_PORT", "9090"),
+		SBIPort:   l.str("SBI_PORT", "8080"),
+		AdminPort: l.str("ADMIN_PORT", "9090"),
 
 		// TLS (empty defaults → h2c)
-		TLSCertFile: getEnv("TLS_CERT_FILE", ""),
-		TLSKeyFile:  getEnv("TLS_KEY_FILE", ""),
+		TLSCertFile: l.str("TLS_CERT_FILE", ""),
+		TLSKeyFile:  l.str("TLS_KEY_FILE", ""),
 
-		// mTLS (defaults: off until operator opts in)
-		MTLSClientCAFile:     getEnv("MTLS_CLIENT_CA_FILE", ""),
-		MTLSClientAuthMode:   getEnv("MTLS_CLIENT_AUTH_MODE", "off"),
-		MTLSOutboundCertFile: getEnv("MTLS_OUTBOUND_CERT_FILE", ""),
-		MTLSOutboundKeyFile:  getEnv("MTLS_OUTBOUND_KEY_FILE", ""),
-		MTLSOutboundCAFile:   getEnv("MTLS_OUTBOUND_CA_FILE", ""),
+		// Secure by default: TLS, client certificates and OAuth are
+		// required; each is switched off only by its own explicit setting.
+		AllowPlaintextSBI:    l.boolean("ALLOW_PLAINTEXT_SBI", false),
+		MTLSClientCAFile:     l.str("MTLS_CLIENT_CA_FILE", ""),
+		MTLSClientAuthMode:   l.str("MTLS_CLIENT_AUTH_MODE", "require"),
+		MTLSOutboundCertFile: l.str("MTLS_OUTBOUND_CERT_FILE", ""),
+		MTLSOutboundKeyFile:  l.str("MTLS_OUTBOUND_KEY_FILE", ""),
+		MTLSOutboundCAFile:   l.str("MTLS_OUTBOUND_CA_FILE", ""),
 
 		// NATS
-		NatsURL:            getEnv("NATS_URL", "nats://localhost:4222"),
-		NatsConnectTimeout: getDurationEnv("NATS_CONNECT_TIMEOUT", 5*time.Second),
-		NatsRequestTimeout: getDurationEnv("NATS_REQUEST_TIMEOUT", 2*time.Second),
+		NatsURL:            l.str("NATS_URL", "nats://localhost:4222"),
+		NatsConnectTimeout: l.duration("NATS_CONNECT_TIMEOUT", 5*time.Second),
+		NatsRequestTimeout: l.duration("NATS_REQUEST_TIMEOUT", 2*time.Second),
+		NatsCredsFile:      l.str("NATS_CREDS_FILE", ""),
+		NatsNkeySeedFile:   l.str("NATS_NKEY_SEED_FILE", ""),
+		NatsUser:           l.str("NATS_USER", ""),
+		NatsPasswordFile:   l.str("NATS_PASSWORD_FILE", ""),
+		NatsTokenFile:      l.str("NATS_TOKEN_FILE", ""),
+		NatsTLSCAFile:      l.str("NATS_TLS_CA_FILE", ""),
+		NatsTLSCertFile:    l.str("NATS_TLS_CERT_FILE", ""),
+		NatsTLSKeyFile:     l.str("NATS_TLS_KEY_FILE", ""),
 
 		// Logging
-		LogLevel: getEnv("LOG_LEVEL", "info"),
+		LogLevel: l.str("LOG_LEVEL", "info"),
 
 		// Retry
-		MaxRetries:     getIntEnv("MAX_RETRIES", 3),
-		RetryBaseDelay: getDurationEnv("RETRY_BASE_DELAY", 1*time.Second),
+		MaxRetries:     l.integer("MAX_RETRIES", 3),
+		RetryBaseDelay: l.duration("RETRY_BASE_DELAY", 1*time.Second),
+		NotifyWorkers:  l.integer("NOTIFY_WORKERS", 32),
 
 		// Shutdown
-		ShutdownDrainDelay: getDurationEnv("SHUTDOWN_DRAIN_DELAY", 5*time.Second),
+		ShutdownDrainDelay: l.duration("SHUTDOWN_DRAIN_DELAY", 5*time.Second),
+		ShutdownTimeout:    l.duration("SHUTDOWN_TIMEOUT", 20*time.Second),
 
 		// Rate limiting (0 RPS disables it)
-		RateLimitRPS:   getFloatEnv("RATE_LIMIT_RPS", 0),
-		RateLimitBurst: getIntEnv("RATE_LIMIT_BURST", 100),
+		RateLimitRPS:   l.float("RATE_LIMIT_RPS", 0),
+		RateLimitBurst: l.integer("RATE_LIMIT_BURST", 100),
 
-		// OAuth2 NF tokens (defaults: disabled until operator opts in).
-		OAuthDisabled:           getBoolEnv("OAUTH_DISABLED", true),
-		OAuthAudience:           getEnv("OAUTH_AUDIENCE", ""),
-		OAuthNRFJWKSURL:         getEnv("OAUTH_NRF_JWKS_URL", ""),
-		OAuthJWKSFile:           getEnv("OAUTH_JWKS_FILE", ""),
-		OAuthJWKSRefresh:        getDurationEnv("OAUTH_JWKS_REFRESH", 5*time.Minute),
-		OAuthClockSkew:          getDurationEnv("OAUTH_CLOCK_SKEW", 30*time.Second),
-		OAuthResultCacheTTL:     getDurationEnv("OAUTH_RESULT_CACHE_TTL", 60*time.Second),
-		OAuthRequireCertBinding: getBoolEnv("OAUTH_REQUIRE_CERT_BINDING", false),
+		// OAuth2 NF tokens: required unless OAUTH_DISABLED=true.
+		OAuthDisabled:           l.boolean("OAUTH_DISABLED", false),
+		OAuthAudience:           l.str("OAUTH_AUDIENCE", ""),
+		OAuthNRFJWKSURL:         l.str("OAUTH_NRF_JWKS_URL", ""),
+		OAuthJWKSFile:           l.str("OAUTH_JWKS_FILE", ""),
+		OAuthJWKSRefresh:        l.duration("OAUTH_JWKS_REFRESH", 5*time.Minute),
+		OAuthClockSkew:          l.duration("OAUTH_CLOCK_SKEW", 30*time.Second),
+		OAuthResultCacheTTL:     l.duration("OAUTH_RESULT_CACHE_TTL", 60*time.Second),
+		OAuthRequireCertBinding: l.boolean("OAUTH_REQUIRE_CERT_BINDING", false),
 
 		// Outbound profile (default: sbi_direct).
-		OutboundProfile: getEnv("OUTBOUND_PROFILE", "sbi_direct"),
+		OutboundProfile:             l.str("OUTBOUND_PROFILE", "sbi_direct"),
+		OutboundAllowedDestinations: l.str("OUTBOUND_ALLOWED_DESTINATIONS", ""),
+		OutboundAllowAny:            l.boolean("OUTBOUND_ALLOW_ANY", false),
 
 		// SMS (OTA) surfaces (default: off until operator opts in).
-		OTAEnabled:      getBoolEnv("OTA_ENABLED", false),
-		OTAResolverFile: getEnv("OTA_RESOLVER_FILE", ""),
-		OTAUecmTimeout:  getDurationEnv("OTA_UECM_TIMEOUT", 3*time.Second),
+		OTAEnabled:      l.boolean("OTA_ENABLED", false),
+		OTAResolverFile: l.str("OTA_RESOLVER_FILE", ""),
+		OTAUecmTimeout:  l.duration("OTA_UECM_TIMEOUT", 3*time.Second),
 
 		// Audit (default: enabled — slog fallback if NATS publisher absent).
-		AuditDisabled:    getBoolEnv("AUDIT_DISABLED", false),
-		AuditNATSSubject: getEnv("AUDIT_NATS_SUBJECT", "audit.events"),
+		AuditDisabled:    l.boolean("AUDIT_DISABLED", false),
+		AuditNATSSubject: l.str("AUDIT_NATS_SUBJECT", "audit.events"),
 	}
+	return cfg, errors.Join(l.errs...)
 }
 
-// getBoolEnv parses a boolean env var. "1", "true", "TRUE", "yes" are true;
-// anything else (including empty) returns the default. Strict on purpose —
-// silent acceptance of typos like "ture" is the kind of thing that turns
-// off auth in production.
-func getBoolEnv(key string, defaultVal bool) bool {
+// loader reads environment variables and records each value that does not parse.
+type loader struct{ errs []error }
+
+func (l *loader) invalid(key, val, want string) {
+	l.errs = append(l.errs, fmt.Errorf("%s=%q: want %s", key, val, want))
+}
+
+// str returns the variable, or def when it is empty.
+func (l *loader) str(key, def string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return def
+}
+
+// boolean accepts 1/0, true/false, yes/no and on/off in any case.
+func (l *loader) boolean(key string, def bool) bool {
 	val := os.Getenv(key)
 	if val == "" {
-		return defaultVal
+		return def
 	}
 	switch strings.ToLower(val) {
 	case "1", "true", "yes", "on":
 		return true
 	case "0", "false", "no", "off":
 		return false
-	default:
-		return defaultVal
 	}
+	l.invalid(key, val, "true or false")
+	return def
 }
 
-// getEnv returns the value of an environment variable or a default value
-func getEnv(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+func (l *loader) integer(key string, def int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
 	}
-	return defaultVal
+	i, err := strconv.Atoi(val)
+	if err != nil {
+		l.invalid(key, val, "an integer")
+		return def
+	}
+	return i
 }
 
-// getIntEnv returns an integer environment variable or a default value
-func getIntEnv(key string, defaultVal int) int {
-	if val := os.Getenv(key); val != "" {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
-		}
+func (l *loader) float(key string, def float64) float64 {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
 	}
-	return defaultVal
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		l.invalid(key, val, "a number")
+		return def
+	}
+	return f
 }
 
-// getFloatEnv returns a float environment variable or a default value
-func getFloatEnv(key string, defaultVal float64) float64 {
-	if val := os.Getenv(key); val != "" {
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
-			return f
-		}
+// duration takes a Go duration: "500ms", "2s", "5m".
+func (l *loader) duration(key string, def time.Duration) time.Duration {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
 	}
-	return defaultVal
-}
-
-// getDurationEnv returns a duration environment variable or a default value
-func getDurationEnv(key string, defaultVal time.Duration) time.Duration {
-	if val := os.Getenv(key); val != "" {
-		if d, err := time.ParseDuration(val); err == nil {
-			return d
-		}
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		l.invalid(key, val, `a duration such as "2s"`)
+		return def
 	}
-	return defaultVal
+	return d
 }

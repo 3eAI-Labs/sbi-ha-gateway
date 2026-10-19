@@ -44,10 +44,20 @@ func NewClient(url string, log *slog.Logger) (*Client, error) {
 }
 
 func NewClientWithTimeout(url string, log *slog.Logger, connectTimeout time.Duration) (*Client, error) {
+	return NewClientWithSecurity(url, log, connectTimeout, Security{})
+}
+
+// NewClientWithSecurity connects with sec's authentication and TLS. Settings that
+// contradict each other are an error before any connection is attempted.
+func NewClientWithSecurity(url string, log *slog.Logger, connectTimeout time.Duration, sec Security) (*Client, error) {
 	if connectTimeout == 0 {
 		connectTimeout = DefaultConnectTimeout
 	}
-	nc, err := nats.Connect(url,
+	secOpts, err := sec.options(url)
+	if err != nil {
+		return nil, err
+	}
+	nc, err := nats.Connect(url, append([]nats.Option{
 		nats.Name("SBI-Gateway"),
 		nats.Timeout(connectTimeout),
 		nats.RetryOnFailedConnect(true),
@@ -68,7 +78,7 @@ func NewClientWithTimeout(url string, log *slog.Logger, connectTimeout time.Dura
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			metrics.SetNatsConnected(false)
 		}),
-	)
+	}, secOpts...)...)
 	if err != nil {
 		metrics.SetNatsConnected(false)
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)

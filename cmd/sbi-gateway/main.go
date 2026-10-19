@@ -5,11 +5,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +22,7 @@ import (
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/outbound"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/uecm"
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/nats"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/oauth"
 	cgaudit "github.com/3eAI-Labs/sbi-ha-gateway/internal/platform/audit"
@@ -52,7 +57,10 @@ func Run() error {
 // RunWithContext starts the application with the given context for shutdown control
 func RunWithContext(ctx context.Context) error {
 	// 1. Load Configuration
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("configuration: %w", err)
+	}
 
 	// 2. Initialize Logger. An unknown LOG_LEVEL stops the gateway rather than
 	//    logging at a level nobody asked for.
@@ -61,12 +69,30 @@ func RunWithContext(ctx context.Context) error {
 		return fmt.Errorf("LOG_LEVEL %q: want debug, info, warn or error", cfg.LogLevel)
 	}
 	log := logger.InitLogger("sbi-ha-gateway", level)
-	if cfg.MaxRetries < 1 || cfg.RetryBaseDelay <= 0 {
-		return fmt.Errorf("MAX_RETRIES (%d) must be at least 1 and RETRY_BASE_DELAY (%s) positive",
-			cfg.MaxRetries, cfg.RetryBaseDelay)
+	if cfg.MaxRetries < 1 || cfg.RetryBaseDelay <= 0 || cfg.NotifyWorkers < 1 {
+		return fmt.Errorf("MAX_RETRIES (%d) and NOTIFY_WORKERS (%d) must be at least 1 and RETRY_BASE_DELAY (%s) positive",
+			cfg.MaxRetries, cfg.NotifyWorkers, cfg.RetryBaseDelay)
 	}
-	if cfg.ShutdownDrainDelay < 0 {
-		return fmt.Errorf("SHUTDOWN_DRAIN_DELAY (%s) must not be negative", cfg.ShutdownDrainDelay)
+	// Secure by default: cleartext is an explicit choice.
+	if !cfg.TLSEnabled() && !cfg.AllowPlaintextSBI {
+		return errors.New("the SBI port needs TLS: set TLS_CERT_FILE and TLS_KEY_FILE, " +
+			"or ALLOW_PLAINTEXT_SBI=true to serve cleartext h2c")
+	}
+	// The SBI port's TLS configuration (server.BuildTLSConfig: TLS 1.3 and the client
+	// certificate modes), checked before anything connects. Misconfiguration is fatal.
+	tlsCfg, err := server.BuildTLSConfig(server.TLSOptions{
+		CertFile:       cfg.TLSCertFile,
+		KeyFile:        cfg.TLSKeyFile,
+		ClientCAFile:   cfg.MTLSClientCAFile,
+		ClientAuthMode: server.ClientAuthMode(cfg.MTLSClientAuthMode),
+	})
+	if err != nil {
+		log.Error("TLS config build failed", slog.Any("error", err))
+		return err
+	}
+	if cfg.ShutdownDrainDelay < 0 || cfg.ShutdownTimeout <= 0 {
+		return fmt.Errorf("SHUTDOWN_DRAIN_DELAY (%s) must not be negative and SHUTDOWN_TIMEOUT (%s) must be positive",
+			cfg.ShutdownDrainDelay, cfg.ShutdownTimeout)
 	}
 	log.Info("Starting SBI HA Gateway...",
 		slog.String("sbi_port", cfg.SBIPort),
@@ -74,7 +100,14 @@ func RunWithContext(ctx context.Context) error {
 	)
 
 	// 3. Initialize NATS
-	nc, err := nats.NewClientWithTimeout(cfg.NatsURL, log, cfg.NatsConnectTimeout)
+	natsSec := nats.Security{
+		CredsFile: cfg.NatsCredsFile, NkeySeedFile: cfg.NatsNkeySeedFile,
+		User: cfg.NatsUser, PasswordFile: cfg.NatsPasswordFile, TokenFile: cfg.NatsTokenFile,
+		CAFile: cfg.NatsTLSCAFile, CertFile: cfg.NatsTLSCertFile, KeyFile: cfg.NatsTLSKeyFile,
+	}
+	natsAuth, natsTransport := natsSec.Describe(cfg.NatsURL)
+	log.Info("Connecting to NATS", slog.String("authentication", natsAuth), slog.String("transport", natsTransport))
+	nc, err := nats.NewClientWithSecurity(cfg.NatsURL, log, cfg.NatsConnectTimeout, natsSec)
 	if err != nil {
 		log.Error("Failed to connect to NATS", slog.Any("error", err))
 		return err
@@ -93,10 +126,7 @@ func RunWithContext(ctx context.Context) error {
 	}
 
 	// 4. Setup Router & Handlers
-	authH := handlers.NewAuthHandler(log, nc, cfg.NatsRequestTimeout)
-	mobH := handlers.NewMobilityHandler(log, nc, cfg.NatsRequestTimeout)
-	dataH := handlers.NewDataHandler(log, nc, cfg.NatsRequestTimeout)
-	mtH := handlers.NewMTHandler(log, nc, cfg.NatsRequestTimeout)
+	sbiH := handlers.NewSBIHandler(log, nc, cfg.NatsRequestTimeout)
 
 	// 4.0 Build OAuth validator (or nil when disabled). Failing here is
 	// fatal: a misconfigured auth subsystem must not silently degrade to
@@ -112,15 +142,11 @@ func RunWithContext(ctx context.Context) error {
 			slog.String("nrf_jwks_url", cfg.OAuthNRFJWKSURL),
 			slog.String("jwks_file", cfg.OAuthJWKSFile),
 		)
-	} else {
-		log.Warn("OAuth2 NF token authentication DISABLED — gateway will accept unauthenticated SBI requests")
 	}
+	reportSecurity(log, cfg)
 
 	r := server.NewRouter(server.RouterConfig{
-		AuthHandler:    authH,
-		MobH:           mobH,
-		DataH:          dataH,
-		MtH:            mtH,
+		SBI:            sbiH,
 		OAuthValidator: oauthValidator,
 		RateLimitRPS:   cfg.RateLimitRPS,
 		RateLimitBurst: cfg.RateLimitBurst,
@@ -133,6 +159,12 @@ func RunWithContext(ctx context.Context) error {
 	amfCfg.TLSCertFile = cfg.MTLSOutboundCertFile
 	amfCfg.TLSKeyFile = cfg.MTLSOutboundKeyFile
 	amfCfg.TLSCAFile = cfg.MTLSOutboundCAFile
+	// Where callbacks and SMSF calls may go, checked on the dialled
+	// address.
+	amfCfg.Destinations, err = sbi.ParseDestinations(cfg.OutboundAllowedDestinations, cfg.OutboundAllowAny)
+	if err != nil {
+		return err
+	}
 	amfClient, err := sbi.NewAmfClientWithConfig(amfCfg)
 	if err != nil {
 		log.Error("Outbound HTTP client init failed", slog.Any("error", err))
@@ -158,12 +190,13 @@ func RunWithContext(ctx context.Context) error {
 
 	// 4.3 Start NATS Subscriber (Callback Listener) with HA failover.
 	sub := nats.NewSubscriberWithOutbound(nc.GetConn(), log, outClient, nats.DefaultCallbackTimeout).
-		WithRetry(cfg.MaxRetries, cfg.RetryBaseDelay)
+		WithRetry(cfg.MaxRetries, cfg.RetryBaseDelay).
+		WithWorkers(cfg.NotifyWorkers)
 	if err := sub.Start(); err != nil {
 		log.Error("Failed to start NATS subscriber", slog.Any("error", err))
-	} else {
-		log.Info("NATS Subscriber started (Listening for Callbacks with HA failover)")
+		return err
 	}
+	log.Info("NATS Subscriber started (Listening for Callbacks with HA failover)")
 
 	// 4.4 Start the SMS (OTA) subscriber: serving-SMSF lookup and SendSMS. Opt-in via
 	// OTA_ENABLED — when off, the UECM / SMSF subjects are not consumed
@@ -196,88 +229,127 @@ func RunWithContext(ctx context.Context) error {
 		)
 	}
 
-	// 5. Start Admin Server
 	adminSrv := admin.NewAdminServer(nc)
-	adminHTTPSrv := adminSrv.HTTPServer(":" + cfg.AdminPort)
-	go func() {
-		log.Info("Admin server starting", slog.String("port", cfg.AdminPort))
-		if err := adminHTTPSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("Admin server failed", slog.Any("error", err))
-		}
-	}()
-
-	// 6. Start Main HTTP/2 Server. TLS config now centralised in
-	//    server.BuildTLSConfig — handles plain TLS 1.3 + the mTLS auth
-	//    modes (off/optional/require). Misconfiguration is fatal here.
-	tlsCfg, err := server.BuildTLSConfig(server.TLSOptions{
-		CertFile:       cfg.TLSCertFile,
-		KeyFile:        cfg.TLSKeyFile,
-		ClientCAFile:   cfg.MTLSClientCAFile,
-		ClientAuthMode: server.ClientAuthMode(cfg.MTLSClientAuthMode),
-	})
-	if err != nil {
-		log.Error("TLS config build failed", slog.Any("error", err))
-		return err
+	if oauthValidator != nil {
+		// Without a verification key every token is rejected: not ready until the NRF answers.
+		adminSrv.AddReadinessCheck(func() bool { return oauth.Ready(oauthValidator) })
 	}
+	adminHTTPSrv := adminSrv.HTTPServer(":" + cfg.AdminPort)
 	srv := sbiServer(":"+cfg.SBIPort, cfg.NatsRequestTimeout, tlsCfg != nil)
 	srv.Handler = r
 	srv.TLSConfig = tlsCfg
 
+	// 6. Open both ports before serving either: a port that cannot be bound stops the
+	//    gateway instead of leaving a process whose readiness says it serves.
+	adminLn, err := net.Listen("tcp", adminHTTPSrv.Addr)
+	if err != nil {
+		return fmt.Errorf("admin port: %w", err)
+	}
+	sbiLn, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		_ = adminLn.Close()
+		return fmt.Errorf("SBI port: %w", err)
+	}
+
+	// A server that stops on its own — a certificate file that cannot be read, a listener
+	// that fails — stops the gateway the same way.
+	serveCtx, stopServing := context.WithCancel(ctx)
+	defer stopServing()
+	var serveErr error
+	var serveErrOnce sync.Once
+	failed := func(name string, err error) {
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		serveErrOnce.Do(func() { serveErr = fmt.Errorf("%s: %w", name, err) })
+		log.Error("Server failed", slog.String("server", name), slog.Any("error", err))
+		stopServing()
+	}
+	go func() {
+		log.Info("Admin server starting", slog.String("port", cfg.AdminPort))
+		failed("admin server", adminHTTPSrv.Serve(adminLn))
+	}()
 	go func() {
 		if tlsCfg != nil {
 			log.Info("SBI Gateway listening (TLS 1.3)",
 				slog.String("port", cfg.SBIPort),
 				slog.String("client_auth", cfg.MTLSClientAuthMode),
 			)
-			if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && err != http.ErrServerClosed {
-				log.Error("HTTPS server failed", slog.Any("error", err))
-			}
+			failed("SBI server", srv.ServeTLS(sbiLn, "", "")) // TLSConfig.Certificates is loaded
 			return
 		}
-
 		log.Info("SBI Gateway listening (h2c, no TLS)", slog.String("port", cfg.SBIPort))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("HTTP server failed", slog.Any("error", err))
-		}
+		failed("SBI server", srv.Serve(sbiLn))
 	}()
 
-	// 7. Wait for shutdown signal via context
-	<-ctx.Done()
+	// 7. Wait for the shutdown signal, or for a server to fail.
+	<-serveCtx.Done()
 
-	// A terminating pod leaves the Service's endpoints, but kube-proxy and any balancer in
-	// front route to it for a moment longer: closing the listener now would refuse those
-	// connections. Serve on for the drain delay, answering not ready meanwhile.
-	log.Info("Shutting down gracefully...", slog.Duration("drain_delay", cfg.ShutdownDrainDelay))
-	adminSrv.Drain()
-	time.Sleep(cfg.ShutdownDrainDelay)
+	if serveErr == nil {
+		// A terminating pod leaves the Service's endpoints, but kube-proxy and any balancer
+		// in front route to it for a moment longer: closing the listener now would refuse
+		// those connections. Serve on for the drain delay, answering not ready meanwhile.
+		log.Info("Shutting down gracefully...", slog.Duration("drain_delay", cfg.ShutdownDrainDelay))
+		adminSrv.Drain()
+		time.Sleep(cfg.ShutdownDrainDelay)
+	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The SBI requests in flight, the notification deliveries and the SMS being sent finish
+	// side by side within SHUTDOWN_TIMEOUT; NATS stays connected until all have (the deferred
+	// Close flushes what they published).
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-
-	// Stop NATS subscribers first (drain in-flight messages)
+	var stopping sync.WaitGroup
+	var sbiErr error
+	stopping.Go(func() { sbiErr = srv.Shutdown(shutdownCtx) })
+	stopping.Go(func() { _ = sub.Stop(shutdownCtx) }) // logs its own outcome
 	if otaSub != nil {
-		if err := otaSub.Stop(); err != nil {
-			log.Warn("Failed to stop OTA subscriber cleanly", slog.Any("error", err))
-		}
+		stopping.Go(func() { _ = otaSub.Stop(shutdownCtx) })
 	}
-	if err := sub.Stop(); err != nil {
-		log.Warn("Failed to stop NATS subscriber cleanly", slog.Any("error", err))
-	}
+	stopping.Wait()
 
 	if err := adminHTTPSrv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("Admin server did not shut down cleanly", slog.Any("error", err))
 	}
-	return srv.Shutdown(shutdownCtx)
+	if sbiErr != nil {
+		return sbiErr
+	}
+	return serveErr
+}
+
+// reportSecurity logs each SBI protection an explicit setting switched off and sets its
+// gauge, so that a weakened pod shows in its log and can be alerted on.
+func reportSecurity(log *slog.Logger, cfg *config.Config) {
+	for _, p := range []struct {
+		name, setting string
+		on            bool
+	}{
+		{"tls", "ALLOW_PLAINTEXT_SBI=true: the SBI port serves cleartext h2c", cfg.TLSEnabled()},
+		{"client_certificate", "MTLS_CLIENT_AUTH_MODE=" + cfg.MTLSClientAuthMode +
+			": client certificates are not required", cfg.MTLSClientAuthMode == "require"},
+		{"oauth", "OAUTH_DISABLED=true: SBI requests are accepted without an access token", !cfg.OAuthDisabled},
+		{"outbound_destinations", "OUTBOUND_ALLOW_ANY=true: callbacks and SMSF calls may reach any host " +
+			"but loopback, link-local, unspecified and multicast addresses", !cfg.OutboundAllowAny},
+	} {
+		metrics.SetSecurityProtection(p.name, p.on)
+		if !p.on {
+			log.Warn("SBI protection off", slog.String("protection", p.name), slog.String("setting", p.setting))
+		}
+	}
+	if !cfg.OutboundAllowAny && strings.TrimSpace(cfg.OutboundAllowedDestinations) == "" {
+		log.Warn("No outbound destination allowed: notifications and SMS fail until " +
+			"OUTBOUND_ALLOWED_DESTINATIONS lists their hosts")
+	}
 }
 
 // sbiServer returns the SBI port's server: HTTP/2 over TLS (ALPN h2) when tls, else
-// unencrypted HTTP/2 with prior knowledge (h2c); HTTP/1.1 is served too, as before.
+// unencrypted HTTP/2 with prior knowledge (h2c). Never HTTP/1.1: TS 29.500 clause 5.2.1
+// requires HTTP/2 on the service-based interface.
 // Slow or idle peers must not hold connections. With HTTP/2 the read and write
 // timeouts apply per stream; the write timeout covers the wait for the application's
 // reply, natsRequestTimeout.
 func sbiServer(addr string, natsRequestTimeout time.Duration, tls bool) *http.Server {
 	var protocols http.Protocols
-	protocols.SetHTTP1(true)
 	if tls {
 		protocols.SetHTTP2(true)
 	} else {
@@ -293,6 +365,18 @@ func sbiServer(addr string, natsRequestTimeout time.Duration, tls bool) *http.Se
 	}
 }
 
+// jwksHTTPClient fetches the NRF's JWKS with the gateway's outbound TLS identity
+// (MTLS_OUTBOUND_*: the NRF is one more 5GC peer) and a bound on each fetch.
+func jwksHTTPClient(cfg *config.Config) (*http.Client, error) {
+	tlsCfg, err := sbi.OutboundTLS(cfg.MTLSOutboundCertFile, cfg.MTLSOutboundKeyFile, cfg.MTLSOutboundCAFile)
+	if err != nil {
+		return nil, err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsCfg
+	return &http.Client{Timeout: 10 * time.Second, Transport: transport}, nil
+}
+
 // buildOAuthValidator constructs the OAuth2 validator from config. Returns
 // (nil, nil) when OAUTH_DISABLED=true — the only path to a running server
 // without authentication, deliberately explicit.
@@ -300,11 +384,16 @@ func buildOAuthValidator(ctx context.Context, cfg *config.Config, log *slog.Logg
 	if cfg.OAuthDisabled {
 		return nil, nil
 	}
+	client, err := jwksHTTPClient(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return oauth.New(ctx, oauth.Config{
 		JWKS: oauth.JWKSConfig{
 			NRFURL:          cfg.OAuthNRFJWKSURL,
 			FilePath:        cfg.OAuthJWKSFile,
 			RefreshInterval: cfg.OAuthJWKSRefresh,
+			HTTPClient:      client,
 		},
 		Audience:           cfg.OAuthAudience,
 		ClockSkew:          cfg.OAuthClockSkew,

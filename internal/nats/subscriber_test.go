@@ -27,10 +27,11 @@ import (
 // up real HTTP servers. Calls are recorded so the failover order can be
 // asserted instead of inferred.
 type fakeOutbound struct {
-	mu      sync.Mutex
-	calls   []string
-	respond func(uri string) (*outbound.Response, error)
-	prof    outbound.Profile
+	mu         sync.Mutex
+	calls      []string
+	respond    func(uri string) (*outbound.Response, error)
+	respondCtx func(ctx context.Context, uri string) (*outbound.Response, error) // instead of respond
+	prof       outbound.Profile
 }
 
 func (f *fakeOutbound) Profile() outbound.Profile {
@@ -40,10 +41,13 @@ func (f *fakeOutbound) Profile() outbound.Profile {
 	return f.prof
 }
 
-func (f *fakeOutbound) Send(_ context.Context, req *outbound.Request) (*outbound.Response, error) {
+func (f *fakeOutbound) Send(ctx context.Context, req *outbound.Request) (*outbound.Response, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, req.CallbackURI)
 	f.mu.Unlock()
+	if f.respondCtx != nil {
+		return f.respondCtx(ctx, req.CallbackURI)
+	}
 	return f.respond(req.CallbackURI)
 }
 
@@ -85,7 +89,7 @@ func TestDeliverWithFailover_PrimarySucceeds(t *testing.T) {
 		},
 	}
 	s := &Subscriber{outbound: fake, log: newQuietLogger(), callbackTimeout: 100 * time.Millisecond}
-	result := s.deliverWithFailover([]string{"http://primary"}, nil)
+	result := s.deliverWithFailover(context.Background(), []string{"http://primary"}, nil).result
 	assert.Equal(t, "ok", result)
 	assert.Equal(t, []string{"http://primary"}, fake.Calls())
 }
@@ -100,7 +104,7 @@ func TestDeliverWithFailover_FailsOverToAlternate(t *testing.T) {
 		},
 	}
 	s := &Subscriber{outbound: fake, log: newQuietLogger(), callbackTimeout: 100 * time.Millisecond}
-	result := s.deliverWithFailover([]string{"http://primary", "http://alt"}, nil)
+	result := s.deliverWithFailover(context.Background(), []string{"http://primary", "http://alt"}, nil).result
 
 	assert.Equal(t, "failover", result, "delivering via alternate must surface as 'failover'")
 	assert.Equal(t, []string{"http://primary", "http://alt"}, fake.Calls(),
@@ -115,7 +119,7 @@ func TestDeliverWithFailover_4xxAborts(t *testing.T) {
 		},
 	}
 	s := &Subscriber{outbound: fake, log: newQuietLogger(), callbackTimeout: 100 * time.Millisecond}
-	result := s.deliverWithFailover([]string{"http://primary", "http://alt"}, nil)
+	result := s.deliverWithFailover(context.Background(), []string{"http://primary", "http://alt"}, nil).result
 
 	assert.Equal(t, "client_error", result)
 	assert.Equal(t, []string{"http://primary"}, fake.Calls(),
@@ -135,7 +139,7 @@ func TestDeliverWithFailover_AllExhausted(t *testing.T) {
 	}
 	s := &Subscriber{outbound: fake, log: newQuietLogger(), callbackTimeout: 50 * time.Millisecond}
 	s.WithRetry(0, 10*time.Millisecond)
-	result := s.deliverWithFailover([]string{"http://only"}, nil)
+	result := s.deliverWithFailover(context.Background(), []string{"http://only"}, nil).result
 
 	assert.Equal(t, "exhausted", result)
 	assert.Equal(t, int32(DefaultFailoverPasses), calls.Load(),
@@ -155,7 +159,7 @@ func TestDeliverWithFailover_RetryPolicy(t *testing.T) {
 	s := &Subscriber{outbound: fake, log: newQuietLogger(), callbackTimeout: 50 * time.Millisecond}
 	s.WithRetry(4, 20*time.Millisecond)
 	start := time.Now()
-	result := s.deliverWithFailover([]string{"http://a", "http://b"}, nil)
+	result := s.deliverWithFailover(context.Background(), []string{"http://a", "http://b"}, nil).result
 	elapsed := time.Since(start)
 
 	assert.Equal(t, "exhausted", result)
@@ -172,15 +176,14 @@ func TestDeliverWithFailover_BypassedIsSuccess(t *testing.T) {
 		},
 	}
 	s := &Subscriber{outbound: fake, log: newQuietLogger(), callbackTimeout: 100 * time.Millisecond}
-	result := s.deliverWithFailover([]string{"http://primary", "http://alt"}, nil)
+	result := s.deliverWithFailover(context.Background(), []string{"http://primary", "http://alt"}, nil).result
 
 	assert.Equal(t, "bypassed", result)
 	assert.Equal(t, []string{"http://primary"}, fake.Calls(),
 		"bypass on first endpoint must short-circuit; alternates not tried")
 }
 
-// End-to-end: drive a real NATS message through Subscriber.handle into a
-// fake outbound and assert the delivery path.
+// End-to-end: a real NATS message reaches the alternate when the primary answers 503.
 func TestSubscriber_HandleE2E_PrimaryFailsAlternateWins(t *testing.T) {
 	srv := runQuickServer()
 	defer srv.Shutdown()
@@ -189,13 +192,15 @@ func TestSubscriber_HandleE2E_PrimaryFailsAlternateWins(t *testing.T) {
 	assert.NoError(t, err)
 	defer conn.Close()
 
-	// Fake httptest endpoints — primary 503, alternate 200.
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer primary.Close()
-	alt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	got := make(chan string, 1)
+	alt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got <- string(body)
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer alt.Close()
 
@@ -205,7 +210,7 @@ func TestSubscriber_HandleE2E_PrimaryFailsAlternateWins(t *testing.T) {
 
 	sub := NewSubscriberWithOutbound(conn, newQuietLogger(), out, 200*time.Millisecond)
 	assert.NoError(t, sub.Start())
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
 	payload, _ := json.Marshal(NotificationPayload{
 		CallbackUri:           primary.URL,
@@ -213,7 +218,10 @@ func TestSubscriber_HandleE2E_PrimaryFailsAlternateWins(t *testing.T) {
 		ChangeItem:            json.RawMessage(`{"hello":"world"}`),
 	})
 	assert.NoError(t, conn.Publish("5g.data.notify", payload))
-
-	// Generous wait — the handler runs async on the NATS dispatcher.
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case body := <-got:
+		assert.JSONEq(t, `{"hello":"world"}`, body)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the alternate got no notification")
+	}
 }

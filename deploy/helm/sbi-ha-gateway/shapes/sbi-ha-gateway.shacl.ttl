@@ -99,16 +99,22 @@ sbi:ProductConfigShape a sh:NodeShape ;
 # looks enabled but silently fails open/closed. These reject such intents.
 # =============================================================================
 
-# 1. OAuth opt-in completeness — enabling NF-token auth without an audience AND a
-#    JWKS source deploys auth that can never validate a token (config.go:52-60).
+# Secure by default: TLS, client certificates and OAuth are required,
+# each switched off only explicitly. A trial install (config.nats.url empty: the bundled NATS)
+# is exempt — the chart switches off what it lacks, so that its defaults start.
+
+# 1. OAuth completeness — OAuth on (the default) without an audience AND a JWKS source
+#    deploys auth that can never validate a token; outside a trial install the chart
+#    refuses to render it.
 sbi:OAuthOptInCompleteShape a sh:NodeShape ;
     sh:targetClass sbi:ProductConfig ;
     sh:sparql [
-        sh:message "config.oauth.disabled=false requires a non-empty oauth.audience AND at least one JWKS source (nrfJwksUrl or jwksFile)." ;
+        sh:message "Outside a trial install, OAuth (config.oauth.disabled=false) requires a non-empty oauth.audience AND at least one JWKS source (nrfJwksUrl or jwksFile); or config.oauth.disabled=true." ;
         sh:select """
             PREFIX sbi: <https://arinna.3eai-labs.com/ontology/sbi-ha-gateway#>
             SELECT $this WHERE {
-                $this sbi:oauthDisabled false .
+                $this sbi:natsUrl ?nu . FILTER ( ?nu != "" )
+                FILTER NOT EXISTS { $this sbi:oauthDisabled true }
                 OPTIONAL { $this sbi:oauthAudience ?aud }
                 OPTIONAL { $this sbi:oauthNrfJwksUrl ?ju }
                 OPTIONAL { $this sbi:oauthJwksFile ?jf }
@@ -120,12 +126,13 @@ sbi:OAuthOptInCompleteShape a sh:NodeShape ;
         """ ;
     ] .
 
-# 2. Outbound mTLS all-or-none — partial cert/key/CA is fatal at startup
-#    (config.go:27-29 "All three or none — partial config is fatal.").
-sbi:MtlsOutboundAllOrNoneShape a sh:NodeShape ;
+# 2. Outbound TLS pairing — a certificate without its key (or the reverse), or a client
+#    certificate without a CA, is fatal at start-up; a CA alone is TLS without a client
+#    certificate (internal/sbi/client.go buildOutboundTLS).
+sbi:MtlsOutboundPairingShape a sh:NodeShape ;
     sh:targetClass sbi:ProductConfig ;
     sh:sparql [
-        sh:message "config.mtls.outbound{CertFile,KeyFile,CAFile} must be all set or all empty (partial config is fatal)." ;
+        sh:message "config.mtls.outboundCertFile and outboundKeyFile go together, and with outboundCAFile; outboundCAFile alone is allowed." ;
         sh:select """
             PREFIX sbi: <https://arinna.3eai-labs.com/ontology/sbi-ha-gateway#>
             SELECT $this WHERE {
@@ -135,7 +142,7 @@ sbi:MtlsOutboundAllOrNoneShape a sh:NodeShape ;
                 BIND( ( BOUND(?c) && ?c != "" ) AS ?hasC )
                 BIND( ( BOUND(?k) && ?k != "" ) AS ?hasK )
                 BIND( ( BOUND(?a) && ?a != "" ) AS ?hasA )
-                FILTER ( ( ?hasC || ?hasK || ?hasA ) && ! ( ?hasC && ?hasK && ?hasA ) )
+                FILTER ( ( ?hasC != ?hasK ) || ( ?hasC && ! ?hasA ) )
             }
         """ ;
     ] .
@@ -150,26 +157,44 @@ sbi:CertBindingRequiresMtlsShape a sh:NodeShape ;
             PREFIX sbi: <https://arinna.3eai-labs.com/ontology/sbi-ha-gateway#>
             SELECT $this WHERE {
                 $this sbi:oauthRequireCertBinding true .
-                OPTIONAL { $this sbi:mtlsClientAuthMode ?m }
-                FILTER ( !BOUND(?m) || ?m = "off" )
+                $this sbi:mtlsClientAuthMode "off" .
             }
         """ ;
     ] .
 
-# 4. Inbound mTLS needs a trust anchor — optional/require without a client-CA
-#    file (or a mounted TLS secret) cannot verify peer certs (config.go:22).
+# 4. Client certificates need TLS and a trust anchor — outside a trial install,
+#    clientAuthMode optional|require (require is the default) needs tls.existingSecret with
+#    ca.crt and config.mtls.clientCAFile; the chart refuses to render it otherwise.
 sbi:MtlsRequiresCAShape a sh:NodeShape ;
     sh:targetClass sbi:ProductConfig ;
     sh:sparql [
-        sh:message "config.mtls.clientAuthMode optional|require requires config.mtls.clientCAFile or tls.existingSecret (a CA to verify peer certs)." ;
+        sh:message "Outside a trial install, config.mtls.clientAuthMode optional|require requires tls.existingSecret AND config.mtls.clientCAFile; or clientAuthMode off." ;
         sh:select """
             PREFIX sbi: <https://arinna.3eai-labs.com/ontology/sbi-ha-gateway#>
             SELECT $this WHERE {
-                $this sbi:mtlsClientAuthMode ?m .
-                FILTER ( ?m = "optional" || ?m = "require" )
+                $this sbi:natsUrl ?nu . FILTER ( ?nu != "" )
+                OPTIONAL { $this sbi:mtlsClientAuthMode ?m }
+                FILTER ( !BOUND(?m) || ?m = "optional" || ?m = "require" )
                 OPTIONAL { $this sbi:mtlsClientCAFile ?ca }
                 OPTIONAL { $this sbi:tlsExistingSecret ?sec }
-                FILTER ( ( !BOUND(?ca) || ?ca = "" ) && ( !BOUND(?sec) || ?sec = "" ) )
+                FILTER ( ( !BOUND(?ca) || ?ca = "" ) || ( !BOUND(?sec) || ?sec = "" ) )
+            }
+        """ ;
+    ] .
+
+# 5. TLS on the SBI port — outside a trial install, tls.existingSecret is required unless
+#    config.security.allowPlaintextSbi=true; the chart refuses to render it otherwise.
+sbi:TlsRequiredShape a sh:NodeShape ;
+    sh:targetClass sbi:ProductConfig ;
+    sh:sparql [
+        sh:message "Outside a trial install, the SBI port needs tls.existingSecret, or config.security.allowPlaintextSbi=true." ;
+        sh:select """
+            PREFIX sbi: <https://arinna.3eai-labs.com/ontology/sbi-ha-gateway#>
+            SELECT $this WHERE {
+                $this sbi:natsUrl ?nu . FILTER ( ?nu != "" )
+                FILTER NOT EXISTS { $this sbi:allowPlaintextSbi true }
+                OPTIONAL { $this sbi:tlsExistingSecret ?sec }
+                FILTER ( !BOUND(?sec) || ?sec = "" )
             }
         """ ;
     ] .

@@ -46,8 +46,8 @@ func OAuthMiddleware(validator oauth.Validator) func(http.Handler) http.Handler 
 
 			bearer, ok := extractBearer(r.Header.Get("Authorization"))
 			if !ok {
-				writeOAuthFail(w, http.StatusUnauthorized,
-					"missing_bearer", oauth.ReasonMissingToken,
+				// No token: the challenge names no error (TS 29.500 clause 6.7.3).
+				writeOAuthFail(w, r, http.StatusUnauthorized, "", "", oauth.ReasonMissingToken,
 					"Authorization header missing or not Bearer-typed")
 				return
 			}
@@ -67,15 +67,15 @@ func OAuthMiddleware(validator oauth.Validator) func(http.Handler) http.Handler 
 				if ve != nil {
 					reason = ve.Reason
 				}
-				status, cause, detail := mapReason(reason)
-				writeOAuthFail(w, status, cause, reason, detail)
+				// Expired, malformed, for another audience, bound to another certificate:
+				// a token "deemed invalid" is 401 invalid_token (TS 29.500 clause 6.7.3).
+				writeOAuthFail(w, r, http.StatusUnauthorized, "invalid_token", "", reason, reasonDetail(reason))
 				return
 			}
 
 			if !oauth.HasScope(claims.Scope, required) {
-				writeOAuthFail(w, http.StatusForbidden,
-					"INSUFFICIENT_SCOPES", oauth.ReasonInsufficientSco,
-					"token scope does not include "+required)
+				writeOAuthFail(w, r, http.StatusForbidden, "insufficient_scope", required,
+					oauth.ReasonInsufficientSco, "token scope does not include the API's scope")
 				return
 			}
 
@@ -103,53 +103,51 @@ func extractBearer(authz string) (string, bool) {
 	return tok, true
 }
 
-// mapReason translates a validator FailReason into the HTTP status, 3GPP
-// cause string, and a short detail. The cause strings come from TS 29.500
-// §6.7.5 Table 6.7.5-1 — these are the values 5G NFs expect to see in
-// ProblemDetails.cause when triggering retry/refresh logic.
-func mapReason(r oauth.FailReason) (status int, cause string, detail string) {
+// reasonDetail is the ProblemDetails detail and the error_description of a validator
+// FailReason. TS 29.500 defines no ProblemDetails cause for these rejections: the
+// WWW-Authenticate challenge is what network functions act on, so none is sent.
+func reasonDetail(r oauth.FailReason) string {
 	switch r {
 	case oauth.ReasonExpired:
-		return http.StatusUnauthorized, "TOKEN_EXPIRED", "access token has expired"
+		return "access token has expired"
 	case oauth.ReasonNotYetValid:
-		return http.StatusUnauthorized, "INVALID_TOKEN", "access token not yet valid"
+		return "access token not yet valid"
 	case oauth.ReasonWrongAudience:
-		return http.StatusForbidden, "INVALID_TOKEN", "audience mismatch"
-	case oauth.ReasonInsufficientSco:
-		return http.StatusForbidden, "INSUFFICIENT_SCOPES", "scope insufficient"
+		return "audience mismatch"
 	case oauth.ReasonMissingClaim:
-		return http.StatusUnauthorized, "INVALID_TOKEN", "required claim missing"
+		return "required claim missing"
 	case oauth.ReasonUnknownKid:
-		return http.StatusUnauthorized, "INVALID_TOKEN", "signing key not recognised"
+		return "signing key not recognised"
 	case oauth.ReasonInvalidSig:
-		return http.StatusUnauthorized, "INVALID_TOKEN", "signature verification failed"
+		return "signature verification failed"
 	case oauth.ReasonDisallowedAlg:
-		return http.StatusUnauthorized, "INVALID_TOKEN", "token algorithm not permitted"
-	case oauth.ReasonMissingToken:
-		return http.StatusUnauthorized, "missing_bearer", "Authorization header missing"
-	// RFC 8705 binding failures. We use the spec's "TOKEN_BINDING_FAILED"
-	// cause string per TS 29.500 §6.7.5 so peer NFs branch on the same
-	// label whether the token was unbound, presented over the wrong
-	// connection, or simply replayed.
+		return "token algorithm not permitted"
+	// RFC 8705 binding failures.
 	case oauth.ReasonCnfMissing:
-		return http.StatusUnauthorized, "TOKEN_BINDING_FAILED", "cert-bound token required (cnf claim missing)"
+		return "cert-bound token required (cnf claim missing)"
 	case oauth.ReasonCnfNoCert:
-		return http.StatusUnauthorized, "TOKEN_BINDING_FAILED", "token is cert-bound but no peer cert presented"
+		return "token is cert-bound but no peer cert presented"
 	case oauth.ReasonCnfMismatch:
-		return http.StatusUnauthorized, "TOKEN_BINDING_FAILED", "peer cert does not match token binding"
+		return "peer cert does not match token binding"
 	default:
-		return http.StatusUnauthorized, "INVALID_TOKEN", "token validation failed"
+		return "token validation failed"
 	}
 }
 
-func writeOAuthFail(w http.ResponseWriter, status int, cause string, reason oauth.FailReason, detail string) {
+// writeOAuthFail rejects r with status, the WWW-Authenticate challenge of TS 29.500 clause
+// 6.7.3 and ProblemDetails. errCode is RFC 6750's error, empty when no token was sent; scope
+// is the scope needed, with insufficient_scope.
+func writeOAuthFail(w http.ResponseWriter, r *http.Request, status int, errCode, scope string, reason oauth.FailReason, detail string) {
 	metrics.RecordOAuthValidation("fail", string(reason))
 
-	// RFC 6750 §3 — challenge header on 401. 403 doesn't carry one.
-	if status == http.StatusUnauthorized {
-		w.Header().Set("WWW-Authenticate",
-			`Bearer error="invalid_token", error_description="`+detail+`"`)
+	params := []string{"realm=" + quoted(apiURI(r))}
+	if errCode != "" {
+		params = append(params, `error="`+errCode+`"`, `error_description="`+rfc6750Chars(detail, true)+`"`)
 	}
+	if scope != "" {
+		params = append(params, `scope="`+rfc6750Chars(scope, false)+`"`)
+	}
+	w.Header().Set("WWW-Authenticate", "Bearer "+strings.Join(params, ", "))
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(models.ProblemDetails{
@@ -157,6 +155,36 @@ func writeOAuthFail(w http.ResponseWriter, status int, cause string, reason oaut
 		Title:  http.StatusText(status),
 		Status: status,
 		Detail: detail,
-		Cause:  cause,
 	})
+}
+
+// apiURI is the realm of TS 29.500 clause 6.7.3, the URI of the API the access failed for:
+// {apiRoot}/{apiName}/{apiVersion} (TS 29.501 clause 4.4.1). The path is taken escaped, so
+// it holds no quote.
+func apiURI(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	segments := strings.SplitN(strings.TrimPrefix(r.URL.EscapedPath(), "/"), "/", 3)
+	if len(segments) > 2 {
+		segments = segments[:2]
+	}
+	return strings.TrimSuffix(scheme+"://"+r.Host+"/"+strings.Join(segments, "/"), "/")
+}
+
+// quoted is s as an RFC 9110 quoted-string.
+func quoted(s string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+}
+
+// rfc6750Chars keeps the characters RFC 6750 clause 3 allows in error_description (space
+// too) or in a scope-token: printable ASCII but '"' and '\', which may not be escaped there.
+func rfc6750Chars(s string, space bool) string {
+	return strings.Map(func(c rune) rune {
+		if c == '"' || c == '\\' || c > '~' || c < ' ' || (c == ' ' && !space) {
+			return -1
+		}
+		return c
+	}, s)
 }

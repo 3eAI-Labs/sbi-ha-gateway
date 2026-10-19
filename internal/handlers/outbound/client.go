@@ -6,6 +6,8 @@ package outbound
 import (
 	"context"
 	"errors"
+
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/sbi"
 )
 
 // ErrBypassed signals that the configured profile does not deliver via this
@@ -47,6 +49,10 @@ type Request struct {
 	// Payload is the JSON-marshalable body to send.
 	Payload interface{}
 
+	// Multipart, when set, is the body instead of Payload: a multipart/related message of
+	// a JSON part and a binary part (e.g. Nsmsf_SMService MtForwardSm).
+	Multipart *sbi.Multipart
+
 	// Headers carries optional per-call HTTP headers (e.g. 3gpp-Sbi-Sender-Timestamp).
 	Headers map[string]string
 }
@@ -55,6 +61,8 @@ type Request struct {
 type Response struct {
 	StatusCode int
 	Body       []byte
+	// Multipart is the response's parts when the request was multipart.
+	Multipart *sbi.Multipart
 }
 
 // Client is the contract every outbound profile must satisfy.

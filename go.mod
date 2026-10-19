@@ -3,11 +3,12 @@ module github.com/3eAI-Labs/sbi-ha-gateway
 go 1.26.9
 
 require (
-	github.com/3eAI-Labs/sbi-ha-gateway-client v0.1.0
+	github.com/3eAI-Labs/sbi-ha-gateway-client v0.3.0
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/lestrrat-go/jwx/v2 v2.1.6
 	github.com/nats-io/nats-server/v2 v2.10.20
 	github.com/nats-io/nats.go v1.48.0
+	github.com/nats-io/nkeys v0.4.12
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
@@ -30,7 +31,6 @@ require (
 	github.com/minio/highwayhash v1.0.3 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nats-io/jwt/v2 v2.5.8 // indirect
-	github.com/nats-io/nkeys v0.4.12 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/common v0.66.1 // indirect

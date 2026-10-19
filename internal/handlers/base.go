@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -28,9 +27,11 @@ import (
 // characters in them: an escaped "/" inside an identifier must not shift the resource path
 // the application receives.
 var (
-	// SUPI formats: imsi-<5-15 digits> or nai-<user@realm>
+	// SUPI formats: imsi-<5-15 digits>, nai-<user@realm>, and the Global Cable and Global
+	// Line Identifiers gci-<...> and gli-<...> (TS 23.003 clause 2.2A, TS 29.571 Supi).
 	supiIMSIPattern = regexp.MustCompile(`^imsi-[0-9]{5,15}$`)
 	supiNAIPattern  = regexp.MustCompile(`^nai-[a-zA-Z0-9_.+-]+@[a-zA-Z0-9.-]+$`)
+	supiGxIPattern  = regexp.MustCompile(`^g(ci|li)-[A-Za-z0-9._~+-]+(@[A-Za-z0-9.-]+)?$`)
 
 	// SUCI format: suci-<supiType>-<mcc>-<mnc>-<routingIndicator>-<protectionSchemeId>-<homeNetworkPublicKeyId>-<schemeOutput>
 	// Example: suci-0-001-01-0000-0-0-0001010000
@@ -52,7 +53,7 @@ const (
 )
 
 func (k UeIDKinds) match(v string) bool {
-	return k&IDSUPI != 0 && (supiIMSIPattern.MatchString(v) || supiNAIPattern.MatchString(v)) ||
+	return k&IDSUPI != 0 && (supiIMSIPattern.MatchString(v) || supiNAIPattern.MatchString(v) || supiGxIPattern.MatchString(v)) ||
 		k&IDSUCI != 0 && suciPattern.MatchString(v) ||
 		k&IDGPSI != 0 && gpsiPattern.MatchString(v) ||
 		k&IDExtGroup != 0 && extGroupPattern.MatchString(v) ||
@@ -102,43 +103,9 @@ func (h *BaseHandler) writeProblemBody(w http.ResponseWriter, status int, prob i
 	}
 }
 
-func (h *BaseHandler) WriteJSON(w http.ResponseWriter, status int, v interface{}) {
-	if status == http.StatusNoContent {
-		// No body: net/http refuses one with 204 (ErrBodyNotAllowed).
-		w.WriteHeader(status)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		if h.Log != nil {
-			h.Log.Error("Failed to encode JSON response", slog.Any("error", err))
-		}
-		metrics.RecordError("encode", "json_response_failed")
-	}
-}
-
 // MaxRequestBodyBytes bounds a request body. Registrations, events and subscriber data
 // are a few kilobytes; a larger body is refused with 413 before it is read further.
 const MaxRequestBodyBytes = 1 << 20
-
-// DecodeBody decodes the request body into v. A body over MaxRequestBodyBytes is
-// answered 413, one that is not JSON 400 INVALID_MSG_FORMAT (TS 29.500 Table
-// 5.2.7.2-1); DecodeBody then returns false.
-func (h *BaseHandler) DecodeBody(w http.ResponseWriter, r *http.Request, v interface{}) bool {
-	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)).Decode(v)
-	if err == nil {
-		return true
-	}
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		h.WriteProblem(w, http.StatusRequestEntityTooLarge, "",
-			fmt.Sprintf("Request body larger than %d bytes", tooLarge.Limit))
-		return false
-	}
-	h.WriteProblem(w, http.StatusBadRequest, "INVALID_MSG_FORMAT", err.Error())
-	return false
-}
 
 // MarshalRequest marshals a backend request payload to JSON.
 // On failure it writes an RFC 7807 problem response and returns ok=false,

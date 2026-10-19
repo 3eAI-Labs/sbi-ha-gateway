@@ -49,6 +49,13 @@ type Validator interface {
 	Validate(ctx context.Context, bearer string, peerCertThumbprint []byte) (*Claims, error)
 }
 
+// Ready reports whether v can accept a token: false while it holds no verification key, as
+// until the NRF first answers. Validators of other packages (test doubles) are ready.
+func Ready(v Validator) bool {
+	own, ok := v.(*validator)
+	return !ok || own.src.held() > 0
+}
+
 // New builds a Validator from cfg. The returned validator is safe for
 // concurrent use; it owns a background-refreshed JWKS cache when
 // cfg.JWKS.NRFURL is set.

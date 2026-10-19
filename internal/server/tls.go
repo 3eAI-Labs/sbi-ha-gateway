@@ -99,15 +99,23 @@ func BuildTLSConfig(o TLSOptions) (*tls.Config, error) {
 			return nil, errors.New("server: MTLS_CLIENT_CA_FILE set but TLS disabled (TLS_CERT_FILE/TLS_KEY_FILE missing)")
 		}
 		if authType != tls.NoClientCert {
-			return nil, fmt.Errorf("server: MTLS_CLIENT_AUTH_MODE=%s needs TLS (TLS_CERT_FILE/TLS_KEY_FILE missing)", o.ClientAuthMode)
+			return nil, fmt.Errorf("server: MTLS_CLIENT_AUTH_MODE=%s needs TLS (TLS_CERT_FILE/TLS_KEY_FILE missing); "+
+				"a cleartext SBI port (ALLOW_PLAINTEXT_SBI) needs MTLS_CLIENT_AUTH_MODE=off", o.ClientAuthMode)
 		}
 		return nil, nil
 	}
 
+	// The certificate is loaded here, at start-up: one that cannot be read stops the gateway
+	// before it listens, rather than failing the server afterwards.
+	pair, err := tls.LoadX509KeyPair(o.CertFile, o.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("server: load TLS_CERT_FILE/TLS_KEY_FILE: %w", err)
+	}
 	cfg := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{"h2"},
-		ClientAuth: authType,
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h2"},
+		ClientAuth:   authType,
+		Certificates: []tls.Certificate{pair},
 	}
 
 	if authType != tls.NoClientCert {

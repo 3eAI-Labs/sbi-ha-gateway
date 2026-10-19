@@ -113,3 +113,21 @@ func TestHTTPServer_Timeouts(t *testing.T) {
 		t.Fatalf("timeouts unset: %+v", srv)
 	}
 }
+
+// A readiness check added by the gateway, such as OAuth holding a verification key, makes
+// /health/ready fail while it is false.
+func TestAdminServer_HealthReady_Check(t *testing.T) {
+	mockNats := new(MockNatsClient)
+	mockNats.On("IsConnected").Return(true)
+	srv := admin.NewAdminServer(mockNats)
+	var ok bool
+	srv.AddReadinessCheck(func() bool { return ok })
+	r := srv.SetupRouter()
+
+	for _, want := range []int{http.StatusServiceUnavailable, http.StatusOK} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+		assert.Equal(t, want, w.Code)
+		ok = true
+	}
+}

@@ -4,16 +4,24 @@
 package nats
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	sbiclient "github.com/3eAI-Labs/sbi-ha-gateway-client"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/outbound"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/uecm"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/sbi"
@@ -79,22 +87,22 @@ func (s *stubOutbound) Send(_ context.Context, r *outbound.Request) (*outbound.R
 
 // --- buildSmsfSendURI -----------------------------------------------------
 
-func TestBuildSmsfSendURI(t *testing.T) {
+func TestBuildSmsfMtURI(t *testing.T) {
 	cases := []struct {
 		fqdn, supi, want string
 	}{
 		{"smsf-1.5gc.tr", "imsi-286010000000001",
-			"https://smsf-1.5gc.tr/nsmsf-sms/v2/ue-contexts/imsi-286010000000001/sendsms"},
+			"https://smsf-1.5gc.tr/nsmsf-sms/v2/ue-contexts/imsi-286010000000001/send-mt-sms"},
 		// Already-schemed FQDN must NOT be double-prefixed.
 		{"http://smsf-1.5gc.tr:8080", "imsi-001",
-			"http://smsf-1.5gc.tr:8080/nsmsf-sms/v2/ue-contexts/imsi-001/sendsms"},
+			"http://smsf-1.5gc.tr:8080/nsmsf-sms/v2/ue-contexts/imsi-001/send-mt-sms"},
 		// Trailing slash on FQDN trimmed; SUPI escaped.
 		{"https://smsf-1.5gc.tr/", "suci-0-001-01-0-0-0-12345",
-			"https://smsf-1.5gc.tr/nsmsf-sms/v2/ue-contexts/suci-0-001-01-0-0-0-12345/sendsms"},
+			"https://smsf-1.5gc.tr/nsmsf-sms/v2/ue-contexts/suci-0-001-01-0-0-0-12345/send-mt-sms"},
 	}
 	for _, c := range cases {
-		if got := buildSmsfSendURI(c.fqdn, c.supi); got != c.want {
-			t.Errorf("buildSmsfSendURI(%q, %q) = %q, want %q", c.fqdn, c.supi, got, c.want)
+		if got := buildSmsfMtURI(c.fqdn, c.supi); got != c.want {
+			t.Errorf("buildSmsfMtURI(%q, %q) = %q, want %q", c.fqdn, c.supi, got, c.want)
 		}
 	}
 }
@@ -121,7 +129,7 @@ func TestUecm_HappyPath_RepliesWithContext(t *testing.T) {
 	if err := sub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
 	req := NudmUecmMessage{
 		MessageType:   "SBI_NUDM_UECM",
@@ -157,7 +165,7 @@ func TestUecm_NotFound_RepliesNF_NOT_FOUND(t *testing.T) {
 		Outbound: &stubOutbound{},
 	})
 	_ = sub.Start(context.Background())
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
 	body, _ := json.Marshal(NudmUecmMessage{
 		MessageType:   "SBI_NUDM_UECM",
@@ -189,7 +197,7 @@ func TestUecm_UnsupportedOp_Replies400(t *testing.T) {
 		Outbound: &stubOutbound{},
 	})
 	_ = sub.Start(context.Background())
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
 	body, _ := json.Marshal(NudmUecmMessage{
 		MessageType:   "SBI_NUDM_UECM",
@@ -219,7 +227,7 @@ func TestUecm_MalformedRequest_NoReply(t *testing.T) {
 		Outbound: &stubOutbound{},
 	})
 	_ = sub.Start(context.Background())
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
 	_, err := conn.Request(subjectUecmRequest, []byte("not json"), 200*time.Millisecond)
 	if err == nil {
@@ -253,67 +261,233 @@ func setupOtaStream(t *testing.T, conn *gnats.Conn) {
 	}
 }
 
-func TestSmsf_HappyPath_PostsToSmsfAndPublishesDelivery(t *testing.T) {
+// testRPData is an RP-DATA towards the UE (TS 24.011 clause 7.3.1.1): MTI 001, message
+// reference 7, a Service Centre address, an empty destination, and a 4-octet TPDU.
+var testRPData = []byte{0x01, 0x07, 0x04, 0x91, 0x09, 0x55, 0xf1, 0x00, 0x04, 0x04, 0x0a, 0x0b, 0x0c}
+
+func rpDataMessage(smsfURL string) []byte {
+	body, _ := json.Marshal(SbiOtaMessage{
+		Header:   SbiHeader{Service: "Nsmsf_SMService", Operation: "MtForwardSm", Version: "v2"},
+		Routing:  SbiRouting{Supi: "imsi-001", SmsfFqdn: smsfURL},
+		Payload:  SS7PayloadView{Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString(testRPData)},
+		Metadata: map[string]string{"tx_id": "tx-abc"},
+	})
+	return body
+}
+
+// sendThroughSmsf publishes message to the SMSF work queue with smsf as the SMSF and
+// returns the DeliveryEvent the gateway publishes.
+func sendThroughSmsf(t *testing.T, smsf http.Handler, message func(smsfURL string) []byte) DeliveryEvent {
+	t.Helper()
+	srv, conn := runOtaServer(t)
+	t.Cleanup(srv.Shutdown)
+	t.Cleanup(conn.Close)
+	setupOtaStream(t, conn)
+	httpServer := httptest.NewServer(smsf)
+	t.Cleanup(httpServer.Close)
+
+	amf := sbi.NewAmfClient()
+	amf.Client.Transport = http.DefaultTransport
+	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
+	c := &Client{conn: conn}
+	js, _ := c.JetStream()
+	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	if err := sub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Stop(context.Background()) })
+
+	deliveries := make(chan DeliveryEvent, 1)
+	if _, err := conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+		var ev DeliveryEvent
+		_ = json.Unmarshal(msg.Data, &ev)
+		deliveries <- ev
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.Publish(context.Background(), subjectSmsfRequest, message(httpServer.URL)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case ev := <-deliveries:
+		return ev
+	case <-time.After(3 * time.Second):
+		t.Fatal("no delivery event published within 3s")
+	}
+	return DeliveryEvent{}
+}
+
+// smsfAnswering is an SMSF that checks the MtForwardSm request (TS 29.540: POST
+// .../send-mt-sms, multipart/related, a JSON root referring to the RP-DATA by Content-ID)
+// and answers 200 with report as the binary part of a multipart/related SmsDeliveryData.
+func smsfAnswering(t *testing.T, report []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/ue-contexts/imsi-001/send-mt-sms") {
+			t.Errorf("path %s", r.URL.Path)
+		}
+		mt, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mt != "multipart/related" || params["type"] != "application/json" {
+			t.Errorf("Content-Type %q", r.Header.Get("Content-Type"))
+		}
+		mr := multipart.NewReader(r.Body, params["boundary"])
+		root, err := mr.NextPart()
+		if err != nil {
+			t.Fatalf("root part: %v", err)
+		}
+		rootBody, _ := io.ReadAll(root)
+		if root.Header.Get("Content-Type") != "application/json" || string(rootBody) != `{"smsPayload":{"contentId":"sms"}}` {
+			t.Errorf("root part %q: %s", root.Header.Get("Content-Type"), rootBody)
+		}
+		bin, err := mr.NextPart()
+		if err != nil {
+			t.Fatalf("binary part: %v", err)
+		}
+		binBody, _ := io.ReadAll(bin)
+		if bin.Header.Get("Content-Type") != "application/vnd.3gpp.sms" || bin.Header.Get("Content-Id") != "sms" ||
+			!bytes.Equal(binBody, testRPData) {
+			t.Errorf("binary part %q %q: %x", bin.Header.Get("Content-Type"), bin.Header.Get("Content-Id"), binBody)
+		}
+
+		var out bytes.Buffer
+		mw := multipart.NewWriter(&out)
+		jp, _ := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/json"}})
+		_, _ = jp.Write([]byte(`{"smsPayload":{"contentId":"report"}}`))
+		if report != nil {
+			bp, _ := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/vnd.3gpp.sms"}, "Content-Id": {"report"}})
+			_, _ = bp.Write(report)
+		}
+		_ = mw.Close()
+		w.Header().Set("Content-Type", "multipart/related; boundary="+mw.Boundary()+`; type="application/json"`)
+		_, _ = w.Write(out.Bytes())
+	}
+}
+
+// The SMS reaches the SMSF as MtForwardSm with the RP-DATA unchanged; the mobile station's
+// RP-ACK (MTI 010) makes it delivered, and the report reaches OTA.
+func TestSmsf_MtForwardSm_Delivered(t *testing.T) {
+	ack := []byte{0x02, 0x07}
+	ev := sendThroughSmsf(t, smsfAnswering(t, ack), rpDataMessage)
+	if ev.Status != "DELIVERED" || ev.Cause != "RP_ACK" || ev.TransactionID != "tx-abc" || ev.Bearer != "SBI" {
+		t.Errorf("event %+v, want DELIVERED/RP_ACK tx-abc SBI", ev)
+	}
+	if ev.BearerMeta["deliveryReport"] != base64.StdEncoding.EncodeToString(ack) {
+		t.Errorf("deliveryReport %q", ev.BearerMeta["deliveryReport"])
+	}
+}
+
+// RP-ERROR (MTI 100) from the mobile station fails the SMS with its cause: #22, memory
+// capacity exceeded (TS 24.011 Table 8.4).
+func TestSmsf_MtForwardSm_RPError(t *testing.T) {
+	ev := sendThroughSmsf(t, smsfAnswering(t, []byte{0x04, 0x07, 0x01, 0x16}), rpDataMessage)
+	if ev.Status != "FAILED" || ev.Cause != "RP_CAUSE_22" {
+		t.Errorf("event %+v, want FAILED/RP_CAUSE_22", ev)
+	}
+}
+
+// A 200 without a report does not tell the gateway the SMS arrived.
+func TestSmsf_MtForwardSm_NoReport(t *testing.T) {
+	ev := sendThroughSmsf(t, smsfAnswering(t, nil), rpDataMessage)
+	if ev.Status != "FAILED" || ev.Cause != "INVALID_DELIVERY_REPORT" {
+		t.Errorf("event %+v, want FAILED/INVALID_DELIVERY_REPORT", ev)
+	}
+}
+
+// A payload that is not an RP-DATA towards the UE — a bare TPDU, as 0.2.x took — fails
+// without reaching the SMSF.
+func TestSmsf_PayloadNotRPData(t *testing.T) {
+	for name, payload := range map[string]SS7PayloadView{
+		"bare TPDU":              {Encoding: "BINARY", Content: "BAoLDA=="},
+		"RP-DATA towards the SC": {Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString([]byte{0x00, 0x07})},
+		"not base64":             {Encoding: sbiclient.EncodingRPData, Content: "%%%"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			called := false
+			ev := sendThroughSmsf(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }),
+				func(smsfURL string) []byte {
+					body, _ := json.Marshal(SbiOtaMessage{
+						Header:  SbiHeader{Service: "Nsmsf_SMService", Operation: "MtForwardSm"},
+						Routing: SbiRouting{Supi: "imsi-001", SmsfFqdn: smsfURL},
+						Payload: payload,
+					})
+					return body
+				})
+			if ev.Status != "FAILED" || ev.Cause != "PAYLOAD_NOT_RP_DATA" || called {
+				t.Errorf("event %+v, SMSF called %v", ev, called)
+			}
+		})
+	}
+}
+
+// An SMSF that keeps failing transiently gets otaMaxDeliver attempts. OTA sees PENDING for
+// each but the last, then FAILED RETRIES_EXHAUSTED with the transient cause, and the work
+// queue no longer holds the SMS.
+func TestSmsf_RetriesExhausted(t *testing.T) {
 	srv, conn := runOtaServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
 	setupOtaStream(t, conn)
 
+	var calls atomic.Int32
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusCreated) // SMSF returns 201 on accept
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer httpServer.Close()
 
 	amf := sbi.NewAmfClient()
 	amf.Client.Transport = http.DefaultTransport
 	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
-
 	c := &Client{conn: conn}
 	js, _ := c.JetStream()
-
-	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{
-		Resolver: uecm.NewEmpty(),
-		Outbound: out,
-	})
+	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	sub.nakDelay = 10 * time.Millisecond
 	if err := sub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
-	// Collect delivery events.
-	deliveries := make(chan DeliveryEvent, 4)
-	_, err := conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+	deliveries := make(chan DeliveryEvent, otaMaxDeliver+1)
+	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
 		var ev DeliveryEvent
 		_ = json.Unmarshal(msg.Data, &ev)
 		deliveries <- ev
 	})
-	if err != nil {
+	if _, err := js.Publish(context.Background(), subjectSmsfRequest, rpDataMessage(httpServer.URL)); err != nil {
 		t.Fatal(err)
 	}
 
-	body, _ := json.Marshal(SbiOtaMessage{
-		Header:   SbiHeader{Service: "Nsmsf_SMService", Operation: "SendSMS", Version: "v1"},
-		Routing:  SbiRouting{Supi: "imsi-001", SmsfFqdn: httpServer.URL},
-		Payload:  SS7PayloadView{Encoding: "BINARY", Content: "ZHVtbXk="},
-		Metadata: map[string]string{"tx_id": "tx-abc"},
-	})
-	if _, err := js.Publish(context.Background(), subjectSmsfRequest, body); err != nil {
-		t.Fatalf("publish: %v", err)
+	for i := 1; i <= otaMaxDeliver; i++ {
+		select {
+		case ev := <-deliveries:
+			if i < otaMaxDeliver && (ev.Status != "PENDING" || ev.Cause != "HTTP_503") {
+				t.Errorf("event %d: %+v, want PENDING/HTTP_503", i, ev)
+			}
+			if i == otaMaxDeliver && (ev.Status != "FAILED" || ev.Cause != "RETRIES_EXHAUSTED" ||
+				ev.BearerMeta["lastCause"] != "HTTP_503" || ev.TransactionID != "tx-abc") {
+				t.Errorf("last event: %+v, want FAILED/RETRIES_EXHAUSTED, lastCause HTTP_503", ev)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("event %d not published", i)
+		}
 	}
-
 	select {
 	case ev := <-deliveries:
-		if ev.Status != "DELIVERED" {
-			t.Errorf("status = %q, want DELIVERED", ev.Status)
-		}
-		if ev.TransactionID != "tx-abc" {
-			t.Errorf("tx_id = %q", ev.TransactionID)
-		}
-		if ev.Bearer != "SBI" {
-			t.Errorf("bearer = %q, want SBI", ev.Bearer)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("no delivery event published within 3s")
+		t.Errorf("event after the last delivery: %+v", ev)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if n := calls.Load(); n != otaMaxDeliver {
+		t.Errorf("SMSF called %d times, want %d", n, otaMaxDeliver)
+	}
+	stream, err := js.Stream(context.Background(), otaStreamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := stream.Info(context.Background(), jetstream.WithSubjectFilter(subjectSmsfRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := info.State.Subjects[subjectSmsfRequest]; n != 0 {
+		t.Errorf("work queue still holds %d SMS", n)
 	}
 }
 
@@ -340,7 +514,7 @@ func TestSmsf_4xxFromSmsf_FailsPermanently(t *testing.T) {
 		Outbound: out,
 	})
 	_ = sub.Start(context.Background())
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
 	deliveries := make(chan DeliveryEvent, 1)
 	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
@@ -352,7 +526,7 @@ func TestSmsf_4xxFromSmsf_FailsPermanently(t *testing.T) {
 	body, _ := json.Marshal(SbiOtaMessage{
 		Header:  SbiHeader{Service: "Nsmsf_SMService", Operation: "SendSMS", Version: "v1"},
 		Routing: SbiRouting{Supi: "imsi-001", SmsfFqdn: httpServer.URL},
-		Payload: SS7PayloadView{Encoding: "BINARY", Content: "ZA=="},
+		Payload: SS7PayloadView{Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString(testRPData)},
 	})
 	_, _ = js.Publish(context.Background(), subjectSmsfRequest, body)
 
@@ -385,7 +559,7 @@ func TestSmsf_PeeringPending_FailsPermanently(t *testing.T) {
 		Outbound: mtcIwf,
 	})
 	_ = sub.Start(context.Background())
-	defer func() { _ = sub.Stop() }()
+	defer func() { _ = sub.Stop(context.Background()) }()
 
 	deliveries := make(chan DeliveryEvent, 1)
 	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
@@ -397,7 +571,7 @@ func TestSmsf_PeeringPending_FailsPermanently(t *testing.T) {
 	body, _ := json.Marshal(SbiOtaMessage{
 		Header:  SbiHeader{Service: "Nsmsf_SMService", Operation: "SendSMS", Version: "v1"},
 		Routing: SbiRouting{Supi: "imsi-001", SmsfFqdn: "doesnotmatter"},
-		Payload: SS7PayloadView{Encoding: "BINARY", Content: "ZA=="},
+		Payload: SS7PayloadView{Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString(testRPData)},
 	})
 	_, _ = js.Publish(context.Background(), subjectSmsfRequest, body)
 
@@ -424,6 +598,7 @@ func TestMetricsResultFor(t *testing.T) {
 		{"FAILED", "INVALID_ROUTING", "client_error"},
 		{"FAILED", "UNSUPPORTED_OPERATION", "client_error"},
 		{"FAILED", "HTTP_503", "failed"},
+		{"FAILED", "RETRIES_EXHAUSTED", "retries_exhausted"},
 	}
 	for _, c := range cases {
 		if got := metricsResultFor(c.status, c.cause); got != c.want {
@@ -456,3 +631,108 @@ func TestTxIDFromMetadata(t *testing.T) {
 // Compile check for the sentinel errors — confirms the dispatcher branches stay
 // compiled in even when we refactor.
 var _ = errors.Is
+
+// An SMSF that OUTBOUND_ALLOWED_DESTINATIONS does not list is never called: the SMS fails
+// permanently, without redelivery.
+func TestSmsf_DestinationNotAllowed(t *testing.T) {
+	srv, conn := runOtaServer(t)
+	defer srv.Shutdown()
+	defer conn.Close()
+	setupOtaStream(t, conn)
+
+	called := make(chan struct{}, 1)
+	smsf := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called <- struct{}{} }))
+	defer smsf.Close()
+
+	cfg := sbi.DefaultAmfClientConfig()
+	cfg.Destinations, _ = sbi.ParseDestinations("smsf.5gc.example", false)
+	amf, err := sbi.NewAmfClientWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
+	c := &Client{conn: conn}
+	js, _ := c.JetStream()
+	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	if err := sub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Stop(context.Background()) }()
+
+	deliveries := make(chan DeliveryEvent, 1)
+	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+		var ev DeliveryEvent
+		_ = json.Unmarshal(msg.Data, &ev)
+		deliveries <- ev
+	})
+	_, _ = js.Publish(context.Background(), subjectSmsfRequest, rpDataMessage(smsf.URL))
+	select {
+	case ev := <-deliveries:
+		if ev.Status != "FAILED" || ev.Cause != "DESTINATION_NOT_ALLOWED" {
+			t.Errorf("event %+v, want FAILED/DESTINATION_NOT_ALLOWED", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no delivery event")
+	}
+	select {
+	case <-called:
+		t.Error("the SMSF was called")
+	default:
+	}
+}
+
+// Stop waits for the SMS being sent, which is acknowledged: cut off, it would be sent again
+// when JetStream redelivered it.
+func TestOTASubscriber_StopWaitsForSMS(t *testing.T) {
+	srv, conn := runOtaServer(t)
+	defer srv.Shutdown()
+	defer conn.Close()
+	setupOtaStream(t, conn)
+
+	inSMSF := make(chan struct{})
+	finished := make(chan struct{})
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(inSMSF)
+		time.Sleep(300 * time.Millisecond)
+		close(finished)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer httpServer.Close()
+
+	amf := sbi.NewAmfClient()
+	amf.Client.Transport = http.DefaultTransport
+	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
+	c := &Client{conn: conn}
+	js, _ := c.JetStream()
+	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	if err := sub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.Publish(context.Background(), subjectSmsfRequest, rpDataMessage(httpServer.URL)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inSMSF:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the SMS did not reach the SMSF")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sub.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Stop returned while the SMS was being sent")
+	}
+	stream, _ := js.Stream(context.Background(), otaStreamName)
+	info, err := stream.Info(context.Background(), jetstream.WithSubjectFilter(subjectSmsfRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := info.State.Subjects[subjectSmsfRequest]; n != 0 {
+		t.Errorf("work queue still holds %d SMS: not acknowledged", n)
+	}
+}

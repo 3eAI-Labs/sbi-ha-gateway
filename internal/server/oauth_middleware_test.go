@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -179,8 +180,9 @@ func TestOAuthMiddleware_MissingBearer(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
 	}
-	if got := rec.Header().Get("WWW-Authenticate"); got == "" {
-		t.Errorf("WWW-Authenticate must be set on 401 (RFC 6750 §3); got empty")
+	// No token sent: no error attribute (TS 29.500 clause 6.7.3).
+	if got, want := rec.Header().Get("WWW-Authenticate"), `Bearer realm="http://example.com/nausf-auth/v1"`; got != want {
+		t.Errorf("WWW-Authenticate %q, want %q", got, want)
 	}
 	var pd models.ProblemDetails
 	if err := json.NewDecoder(rec.Body).Decode(&pd); err != nil {
@@ -206,10 +208,10 @@ func TestOAuthMiddleware_InsufficientScope(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", rec.Code)
 	}
-	var pd models.ProblemDetails
-	_ = json.NewDecoder(rec.Body).Decode(&pd)
-	if pd.Cause != "INSUFFICIENT_SCOPES" {
-		t.Errorf("cause = %q, want INSUFFICIENT_SCOPES", pd.Cause)
+	want := `Bearer realm="http://example.com/nausf-auth/v1", error="insufficient_scope", ` +
+		`error_description="token scope does not include the API's scope", scope="nausf-auth"`
+	if got := rec.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate %s\nwant %s", got, want)
 	}
 }
 
@@ -225,16 +227,15 @@ func TestOAuthMiddleware_ExpiredToken(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
 	}
-	var pd models.ProblemDetails
-	_ = json.NewDecoder(rec.Body).Decode(&pd)
-	if pd.Cause != "TOKEN_EXPIRED" {
-		t.Errorf("cause = %q, want TOKEN_EXPIRED", pd.Cause)
+	want := `Bearer realm="http://example.com/nausf-auth/v1", error="invalid_token", error_description="access token has expired"`
+	if got := rec.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate %s\nwant %s", got, want)
 	}
 }
 
 // End-to-end: PeerIdentityMiddleware → OAuthMiddleware → handler. Verifies
 // that a cert-bound token presented over the cert it was bound to passes,
-// and the same token over a different cert is rejected with TOKEN_BINDING_FAILED.
+// and the same token over a different cert is rejected as an invalid token.
 func TestOAuthMiddleware_RFC8705_BindingMismatchRejected(t *testing.T) {
 	v, signer, _ := mintTestValidator(t, "amf.local")
 
@@ -261,8 +262,8 @@ func TestOAuthMiddleware_RFC8705_BindingMismatchRejected(t *testing.T) {
 	}
 	var pd struct{ Cause string }
 	_ = json.NewDecoder(rec.Body).Decode(&pd)
-	if pd.Cause != "TOKEN_BINDING_FAILED" {
-		t.Errorf("cause = %q, want TOKEN_BINDING_FAILED", pd.Cause)
+	if got := rec.Header().Get("WWW-Authenticate"); !strings.Contains(got, `error="invalid_token"`) || pd.Cause != "" {
+		t.Errorf("WWW-Authenticate %q, cause %q: want invalid_token and no cause", got, pd.Cause)
 	}
 }
 
@@ -310,5 +311,46 @@ func TestExtractBearer(t *testing.T) {
 					c.in, got, ok, c.wantTok, c.wantOk)
 			}
 		})
+	}
+}
+
+// A token for another audience is invalid for this producer: 401 invalid_token, not 403, which
+// TS 29.500 clause 6.7.3 keeps for missing scopes. The realm is the API URI, over https with TLS.
+func TestOAuthMiddleware_WrongAudienceIs401(t *testing.T) {
+	v, signer, _ := mintTestValidator(t, "amf.local")
+	h := OAuthMiddleware(v)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	tok := mintToken(t, signer, "x", "smf.local", "nausf-auth", time.Time{})
+	req := httptest.NewRequest("GET", "https://udm.5gc.example/nausf-auth/v1/ue-authentications", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	want := `Bearer realm="https://udm.5gc.example/nausf-auth/v1", error="invalid_token", error_description="audience mismatch"`
+	if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") != want {
+		t.Errorf("%d %s\nwant 401 %s", rec.Code, rec.Header().Get("WWW-Authenticate"), want)
+	}
+	var pd models.ProblemDetails
+	_ = json.NewDecoder(rec.Body).Decode(&pd)
+	if pd.Cause != "" || pd.Status != http.StatusUnauthorized {
+		t.Errorf("ProblemDetails %+v: want status 401 and no cause", pd)
+	}
+}
+
+// The challenge stays well-formed whatever the request path holds: RFC 6750 forbids '"' and
+// '\\' in error_description and scope, escaped or not.
+func TestOAuthMiddleware_ChallengeFromHostilePath(t *testing.T) {
+	v, signer, _ := mintTestValidator(t, "amf.local")
+	h := OAuthMiddleware(v)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	tok := mintToken(t, signer, "x", "amf.local", "nudm-sdm", time.Time{})
+	req := httptest.NewRequest("GET", "/a%22b%5Cc,d=e/v1/x", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	got := rec.Header().Get("WWW-Authenticate")
+	want := `Bearer realm="http://example.com/a%22b%5Cc,d=e/v1", error="insufficient_scope", ` +
+		`error_description="token scope does not include the API's scope", scope="abc,d=e"`
+	if rec.Code != http.StatusForbidden || got != want {
+		t.Errorf("%d %s\nwant 403 %s", rec.Code, got, want)
 	}
 }

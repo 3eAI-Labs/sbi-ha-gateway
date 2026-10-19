@@ -43,18 +43,23 @@ In scope — anything in this repository that lets an attacker:
 
 Out of scope, because the gateway does not claim to handle them:
 
-- **Insecure defaults left in place.** Out of the box OAuth2 is off (`OAUTH_DISABLED=true`), client
-  certificates are not requested (`MTLS_CLIENT_AUTH_MODE=off`), the SBI port speaks cleartext
-  HTTP/2 when no certificate is configured, and rate limiting is off. Turn them on for any network
-  you do not fully trust.
+- **Protections switched off on purpose.** The gateway requires TLS, client certificates and
+  OAuth2 by default. It refuses to start without them, unless each is switched off explicitly:
+  `ALLOW_PLAINTEXT_SBI`, `MTLS_CLIENT_AUTH_MODE` `off`/`optional`, `OAUTH_DISABLED`.
+  - Each one switched off is logged at start-up and shows as 0 in `sbi_gateway_security_protection`.
+  - Rate limiting is off by default.
 - **The admin port** (`ADMIN_PORT`, default 9090: `/metrics`, `/health/*`, `/admin/stats`) has no
   authentication. Keep it on a network only operators and the cluster can reach.
-- **NATS.** The gateway has no NATS TLS or authentication settings of its own; credentials and
-  `tls://` go in `NATS_URL`, and TLS then uses the system's trusted CAs without a client
-  certificate. Whoever can publish on the gateway's subjects can make it answer network functions,
-  send POST requests to any callback URI or SMSF address in their message, and send SMS. Protect
-  NATS with TLS, authentication and per-subject permissions; that, and the NATS server itself, are
-  the deployment's responsibility.
+- **NATS.** Whoever can publish on the gateway's subjects can make it answer network functions,
+  send POST requests to a callback URI or SMSF address in their message, and send SMS. Those
+  requests reach only the hosts `OUTBOUND_ALLOWED_DESTINATIONS` lists. The check runs on the
+  address actually dialled, and loopback, link-local and metadata addresses are refused unless
+  listed by address.
+  - The gateway authenticates to NATS with user credentials, an nkey, a user and password, or a
+    token, and can use TLS 1.3 with its own CA and a client certificate (`NATS_*` settings,
+    secrets as files).
+  - Use them, and give the gateway's NATS user only the subjects it needs. The permissions, and
+    the NATS server itself, are the deployment's responsibility.
 - **Client identity for rate limiting without OAuth.** The key is then the `User-Agent` header,
   which the client chooses; without one it is the TCP peer's address (forwarding headers are not
   believed). The limiter is a guard against misbehaving peers, not against an attacker, unless

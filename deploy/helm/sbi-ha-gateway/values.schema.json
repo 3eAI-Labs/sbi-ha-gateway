@@ -146,7 +146,7 @@
 
     "terminationGracePeriodSeconds": {
       "type": "integer", "minimum": 1,
-      "description": "Time the kubelet allows the gateway after SIGTERM. Must exceed config.shutdown.drainDelay plus the 5 s shutdown."
+      "description": "Time the kubelet allows the gateway after SIGTERM. Must exceed config.shutdown.drainDelay plus config.shutdown.timeout."
     },
 
     "config": {
@@ -179,7 +179,23 @@
               "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true }
             },
             "connectTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
-            "requestTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" }
+            "requestTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+            "secret": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Credentials and TLS for config.nats.url, from a Secret the operator provides, mounted read-only at /etc/sbi-gateway/nats. Name the keys the Secret holds; leave the others empty. One authentication: user with passwordKey, tokenKey, credsKey or nkeySeedKey. TLS: caKey, and certKey with keyKey for a client certificate. The gateway refuses contradicting settings at start-up.",
+              "properties": {
+                "name": { "type": "string" },
+                "user": { "type": "string" },
+                "passwordKey": { "type": "string" },
+                "tokenKey": { "type": "string" },
+                "credsKey": { "type": "string" },
+                "nkeySeedKey": { "type": "string" },
+                "caKey": { "type": "string" },
+                "certKey": { "type": "string" },
+                "keyKey": { "type": "string" }
+              }
+            }
           }
         },
         "retry": {
@@ -196,13 +212,27 @@
             }
           }
         },
+        "notify": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "workers": {
+              "type": "integer", "minimum": 1, "maximum": 1024,
+              "description": "Notifications delivered at once; one whose network function does not answer holds one. Their order is not kept."
+            }
+          }
+        },
         "shutdown": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "drainDelay": {
               "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$",
-              "description": "After SIGTERM the gateway serves on this long, answering not ready, before it stops listening. Plus the 5 s shutdown, it must stay below terminationGracePeriodSeconds. 0s closes at once."
+              "description": "After SIGTERM the gateway serves on this long, answering not ready, before it stops listening. Plus timeout, it must stay below terminationGracePeriodSeconds. 0s closes at once."
+            },
+            "timeout": {
+              "type": "string", "pattern": "^[1-9][0-9]*(ms|s|m|h)$",
+              "description": "After the drain delay: the time the requests in flight, the notification deliveries and the SMS being sent have to finish. Plus drainDelay, it must stay below terminationGracePeriodSeconds."
             }
           }
         },
@@ -230,6 +260,18 @@
             "keyFile": { "type": "string" }
           }
         },
+        "security": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Secure by default: TLS, client certificates and OAuth are required unless each is switched off explicitly. A trial install (bundled NATS) opts out of what it lacks.",
+          "properties": {
+            "allowPlaintextSbi": {
+              "type": "boolean",
+              "description": "Serve cleartext h2c without tls.existingSecret. A high-risk security change.",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+            }
+          }
+        },
         "mtls": {
           "type": "object",
           "additionalProperties": false,
@@ -239,7 +281,7 @@
             "clientAuthMode": {
               "type": "string",
               "enum": ["off", "optional", "require"],
-              "description": "Inbound mTLS posture. Security-critical — approval-gated.",
+              "description": "Inbound client certificates. Default require: needs tls.existingSecret with ca.crt and clientCAFile. Security-critical — approval-gated.",
               "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
             },
             "outboundCertFile": { "type": "string" },
@@ -254,7 +296,7 @@
           "properties": {
             "disabled": {
               "type": "boolean",
-              "description": "Auth kill switch. Disabling NF-token auth is a high-risk security change.",
+              "description": "Auth kill switch: true accepts SBI requests without an access token. Default false: set audience and nrfJwksUrl (or jwksFile). A high-risk security change.",
               "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
             },
             "audience": {
@@ -286,6 +328,17 @@
               "enum": ["sbi_direct", "scef_rest"],
               "description": "Delivery of data-change notifications: sbi_direct POSTs to the callback URI, scef_rest leaves it to an external adapter.",
               "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "medium" }
+            },
+            "allowedDestinations": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^([*]?[.]?[A-Za-z0-9.-]+|[0-9A-Fa-f:.]+(/[0-9]{1,3})?)$" },
+              "description": "Hosts callbacks and SMSF calls may reach: host names, .domain suffixes, CIDR blocks, addresses. Empty: none (unless allowAny). Loopback, link-local and multicast addresses only when listed by address.",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true }
+            },
+            "allowAny": {
+              "type": "boolean",
+              "description": "Allow callbacks and SMSF calls to any host but loopback, link-local, unspecified and multicast addresses. A high-risk security change.",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
             }
           }
         },
@@ -318,6 +371,30 @@
             }
           }
         }
+      }
+    },
+
+    "extraVolumes": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Further pod volumes, for files the gateway reads by path (outbound TLS, JWKS file, OTA resolver): usually a Secret or a ConfigMap."
+    },
+    "extraVolumeMounts": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Mounts of extraVolumes in the gateway container; mount them read-only."
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ingress to the gateway pods: the SBI port from sbiFrom (empty: anywhere); the admin port, which has no authentication, from pods in the release namespace and adminFrom.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true }
+        },
+        "sbiFrom": { "type": "array", "items": { "type": "object" }, "description": "NetworkPolicyPeer entries allowed to reach the SBI port; empty: anywhere." },
+        "adminFrom": { "type": "array", "items": { "type": "object" }, "description": "NetworkPolicyPeer entries allowed to reach the admin port besides the release namespace, e.g. Prometheus." }
       }
     },
 

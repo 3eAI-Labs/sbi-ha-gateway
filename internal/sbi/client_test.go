@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestAmfClient_SendCallback(t *testing.T) {
@@ -102,13 +103,15 @@ func TestAmfClient_SendCallback_4xxNotRetryable(t *testing.T) {
 
 func TestNewAmfClientWithConfig_PartialMTLS_Fails(t *testing.T) {
 	// Cert without key — operator forgot half the config. We MUST fail
-	// loudly; silently downgrading to plaintext would let outbound traffic
+	// loudly; silently downgrading to another mode would let outbound traffic
 	// to a peer expecting mTLS fail with confusing TLS handshake errors.
+	// (A CA alone is TLS without a client certificate: transport_test.go.)
 	cases := []AmfClientConfig{
 		{TLSCertFile: "/tmp/cert"},                    // cert only
 		{TLSKeyFile: "/tmp/key"},                      // key only
-		{TLSCAFile: "/tmp/ca"},                        // ca only
 		{TLSCertFile: "/tmp/c", TLSKeyFile: "/tmp/k"}, // missing CA
+		{TLSCertFile: "/tmp/c", TLSCAFile: "/tmp/ca"}, // cert and CA, no key
+		{TLSKeyFile: "/tmp/k", TLSCAFile: "/tmp/ca"},  // key and CA, no cert
 	}
 	for i, c := range cases {
 		if _, err := NewAmfClientWithConfig(c); err == nil {
@@ -175,4 +178,39 @@ func TestAmfClient_SendCallback_InvalidURL(t *testing.T) {
 
 	}
 
+}
+
+// Retry-After in both of its forms reaches the caller with the HTTPError (RFC 9110 clause
+// 10.2.3); an absent, invalid or past value is 0.
+func TestRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	for value, want := range map[string]time.Duration{
+		"":                              0,
+		"120":                           2 * time.Minute,
+		" 7 ":                           7 * time.Second,
+		"Mon, 19 Oct 2026 12:00:30 GMT": 30 * time.Second,
+		"Mon, 19 Oct 2026 11:00:00 GMT": 0,
+		"-5":                            0,
+		"soon":                          0,
+	} {
+		h := http.Header{}
+		if value != "" {
+			h.Set("Retry-After", value)
+		}
+		if got := retryAfter(h, now); got != want {
+			t.Errorf("Retry-After %q: %s, want %s", value, got, want)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	client := NewAmfClient()
+	client.Client.Transport = http.DefaultTransport
+	var httpErr *HTTPError
+	if err := client.SendCallback(context.Background(), srv.URL, map[string]int{}); !errors.As(err, &httpErr) || httpErr.RetryAfter != 3*time.Second {
+		t.Errorf("SendCallback: %v, want an HTTPError with RetryAfter 3s", err)
+	}
 }

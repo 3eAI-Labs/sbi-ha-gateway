@@ -12,10 +12,8 @@ import (
 )
 
 type RouterConfig struct {
-	AuthHandler *handlers.AuthHandler
-	MobH        *handlers.MobilityHandler
-	DataH       *handlers.DataHandler
-	MtH         *handlers.MTHandler
+	// SBI serves the Nudm and Nudr operations.
+	SBI *handlers.SBIHandler
 
 	// OAuthValidator authenticates incoming SBI requests via NRF-issued
 	// access tokens. nil disables OAuth (development mode).
@@ -46,17 +44,8 @@ func NewRouter(cfg RouterConfig) *chi.Mux {
 	r.Use(OAuthMiddleware(cfg.OAuthValidator))
 	r.Use(NFRateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst))
 
-	if cfg.AuthHandler != nil {
-		cfg.AuthHandler.RegisterRoutes(r)
-	}
-	if cfg.MobH != nil {
-		cfg.MobH.RegisterRoutes(r)
-	}
-	if cfg.DataH != nil {
-		cfg.DataH.RegisterRoutes(r)
-	}
-	if cfg.MtH != nil {
-		cfg.MtH.RegisterRoutes(r)
+	if cfg.SBI != nil {
+		cfg.SBI.RegisterRoutes(r)
 	}
 
 	return r

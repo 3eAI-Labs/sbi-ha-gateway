@@ -8,7 +8,218 @@ Versions up to 1.0.0 were released privately. 0.2.0 is the first public release:
 goes down on purpose, because the gateway stays below 1.0 until it has carried traffic on a
 production network. Its entry describes what changed for an installation of 1.0.0.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-19
+
+Conformance to the 3GPP specifications and a secure default. Breaking for applications and for
+installations:
+- Applications move to `sbi-ha-gateway-client` v0.2.0 or later: the specification's bodies,
+  verbatim. v0.3.0 adds the report of undelivered notifications.
+- Nudm_SDM and Nudr are served at `v2`; HTTP/1.1 is refused.
+- An installation must provide TLS, client certificates and OAuth, or switch each off explicitly.
+- Callbacks and SMSF calls need `OUTBOUND_ALLOWED_DESTINATIONS` (or `OUTBOUND_ALLOW_ANY`).
+
+Chart 0.3.0 deploys 0.3.0. Its new values:
+- `config.security`, `config.nats.secret`, `config.outbound`, `config.notify` and
+  `config.shutdown.timeout`;
+- `networkPolicy`, `extraVolumes` and `extraVolumeMounts`.
+
+`config.mtls.clientAuthMode` now defaults to `require` and `config.oauth.disabled` to `false`;
+the trial install switches off what it lacks.
+
+### Changed — breaking
+
+- **The NATS contract carries the specification's bodies verbatim** (`sbi-ha-gateway-client` v0.2.0).
+  Every request is one `Request`: the API, the operation's operationId, method, path, path variables,
+  query, media type and the network function's body, unchanged. Every success reply is one `Reply`:
+  status, the created resource's identifier and the body, returned to the network function
+  unchanged. 0.2.x decoded bodies into types that re-modelled TS 29.503 by hand and did not match it:
+  - the authentication result reached the AUSF as `authVector`/`kAusf`, without `authType` or
+    `avType`, where TS 29.503 defines `authenticationVector`/`kausf` and makes both mandatory;
+  - information elements the types did not model were dropped (`pei`, `imsVoPs`, `nfSetId`,
+    `resetIds` and others);
+  - elements the specification defines as objects were strings, so conforming requests got 400;
+  - a registration's response was the request, not the application's representation.
+- **Nudm_SDM and Nudr_DataRepository are served at `/nudm-sdm/v2` and `/nudr-dr/v2`.** TS 29.503
+  clause 6.1.1 ("The <apiVersion> shall be "v2"") and TS 29.504 define these roots. 0.2.x served both
+  under `v1`, so a network function calling them got 404. A request to `v1` is now answered 400
+  `INVALID_API`, naming the version served.
+- Nudr_DataRepository serves subscription data (TS 29.505) only; 0.2.x passed any data set through.
+- **Audit events name the operation and carry no request body.**
+  - The operation is named by its operationId (`3GppRegistration`, `ConfirmAuth`), not by
+    gateway-made names (`REGISTER_AMF`).
+  - The body is left out because the gateway no longer interprets bodies, so it cannot tell key
+    material from the rest. Nudr's authentication subscription carries `encPermanentKey`, and in a
+    JSON Patch a secret sits under `value`.
+- **Secure by default.** Without settings the gateway refuses to start and
+  names what is missing:
+  - TLS: `TLS_CERT_FILE`/`TLS_KEY_FILE`;
+  - client certificates: `MTLS_CLIENT_AUTH_MODE` is now `require` by default, with
+    `MTLS_CLIENT_CA_FILE`;
+  - OAuth: `OAUTH_DISABLED` is now `false` by default; audience and JWKS source required.
+
+  Each protection is switched off only by its own setting: `ALLOW_PLAINTEXT_SBI=true` (new),
+  `MTLS_CLIENT_AUTH_MODE=off`, `OAUTH_DISABLED=true`. Each one switched off is a WARN at start-up and
+  a 0 in the new gauge `sbi_gateway_security_protection{protection}`.
+
+  The chart follows. With `config.nats.url` set, a missing protection stops the render with what to
+  set. A trial install (the bundled NATS) switches off what it lacks, explicitly, so its defaults
+  still start. **Upgrading from 0.2.x:** add the certificates and OAuth settings, or the opt-outs.
+- **Helm chart: TLS through `tls.existingSecret` works.** In 0.2.x the Secret was mounted root-owned at
+  0400, so the gateway (uid 65532) could not read its certificate and a TLS install never became
+  Ready (measured on kind). The pod now runs with `fsGroup: 65532` and Secrets mount at 0440.
+- **Helm chart:**
+  - `config.mtls.outbound{Cert,Key,CA}File` reach the gateway; 0.2.x defined but never rendered
+    them.
+  - `extraVolumes` and `extraVolumeMounts` mount the files the gateway reads by path: outbound
+    TLS, `config.oauth.jwksFile`, `config.ota.resolverFile`.
+  - A NetworkPolicy lets the unauthenticated admin port be reached only from the release's
+    namespace and `networkPolicy.adminFrom`; the SBI port from `networkPolicy.sbiFrom`, or
+    anywhere.
+  - The SHACL shapes are inside the chart package (`shapes/`) and follow the secure defaults.
+- **Callbacks and SMSF calls reach only allowed destinations.** The URIs come
+  from NATS messages; 0.2.x POSTed to any of them.
+  - `OUTBOUND_ALLOWED_DESTINATIONS` lists host names, `.domain` suffixes, CIDR blocks and addresses.
+    It is checked on the address actually dialled: a name is resolved once and the connection goes
+    to a checked address.
+  - Empty means none; `OUTBOUND_ALLOW_ANY=true` is the explicit opt-out.
+  - Loopback, link-local (cloud metadata), unspecified and multicast addresses are refused unless
+    listed by address.
+  - A refused SMSF fails the SMS with cause `DESTINATION_NOT_ALLOWED`, without redelivery.
+  - Chart: `config.outbound.allowedDestinations`, `config.outbound.allowAny`.
+  - **Upgrading:** list the network functions' hosts, or deliveries fail.
+- **The SBI port speaks HTTP/2 only** (TS 29.500 clause 5.2.1): ALPN `h2` with TLS, prior-knowledge
+  h2c without. 0.2.x also answered HTTP/1.1. The admin port is unchanged.
+
+### Fixed
+
+- **Release artefacts can be verified.**
+  - The image and the chart are signed keylessly with cosign (Sigstore), by the release workflow
+    at the release tag; README "Verifying a release" gives the commands.
+  - The image carries an SPDX SBOM, and the provenance attestation is now requested rather than
+    left to a default.
+  - The image's `org.opencontainers.image.revision` label and its `sha-` tag name the commit of
+    this public repository. 0.2.x named a commit of the private source repository, which nobody
+    else can look up.
+- **The NRF's JWKS:**
+  - Fetched with the `MTLS_OUTBOUND_*` trust anchor and client certificate, as for every 5GC
+    peer, and with a 10 s timeout. 0.2.x used Go's default client: no private CA, no
+    certificate, and no timeout, so an NRF that accepted the connection and never answered held
+    the gateway's start-up indefinitely.
+  - With OAuth on, `/health/ready` is 503 until the gateway holds a verification key. 0.2.x was
+    ready while it rejected every token.
+  - Metrics: `oauth_jwks_keys`, `oauth_jwks_refreshes_total{result}`,
+    `oauth_jwks_last_refresh_timestamp_seconds`.
+  - `OAUTH_JWKS_REFRESH` below 2 s stopped 0.2.x at start-up, with an error about a 15-minute
+    refresh window nobody had set. Down to `1s` now works; below it is refused plainly.
+- **OAuth rejections follow TS 29.500 clause 6.7.3.** The `WWW-Authenticate` challenge names
+  `realm`, the URI of the API (`https://<host>/<apiName>/<apiVersion>`).
+  - Without a token it carries no `error`; 0.2.x sent `error="invalid_token"`.
+  - A token for another audience is 401 `invalid_token`; 0.2.x answered 403, which the clause
+    keeps for missing scopes.
+  - A missing scope is 403 with `error="insufficient_scope"` and the `scope` needed; 0.2.x's 403
+    had no challenge.
+  - The ProblemDetails `cause` values 0.2.x put on these rejections (`TOKEN_EXPIRED`,
+    `INVALID_TOKEN`, `INSUFFICIENT_SCOPES`, `TOKEN_BINDING_FAILED`, `missing_bearer`) are gone.
+    No 3GPP specification defines them; the code attributed them to TS 29.500 clause 6.7.5,
+    which is about client credentials assertions. `detail` still says what failed.
+- **A panic in a handler is answered 500 `SYSTEM_FAILURE` as ProblemDetails.** It is logged as
+  one line with its stack and counted in `requests_total`. 0.2.x answered an empty 500, wrote the
+  stack to stderr as text and counted nothing. A panic after the response began aborts the HTTP/2
+  stream rather than appending to it.
+- **Shutdown waits for the work in flight, within `SHUTDOWN_TIMEOUT`.** 0.2.x gave a fixed 5 s
+  to everything after the drain delay. It started the drain of its NATS subscriptions without
+  waiting for it, so the notifications and the SMS being sent were cut when the process exited.
+  JetStream redelivers an SMS cut mid-call, so one the SMSF had already taken could reach the
+  subscriber twice.
+  - `SHUTDOWN_TIMEOUT` (default `20s`; chart `config.shutdown.timeout`) bounds what follows the
+    drain delay. Within it, side by side: the SBI requests in flight finish, the notification
+    deliveries finish or are reported, and the SMS being sent finishes and is acknowledged.
+  - SMS fetched but not started are redelivered by JetStream, to another replica when there is
+    one.
+  - The chart refuses `config.shutdown.drainDelay` plus `config.shutdown.timeout` that does not
+    fit in `terminationGracePeriodSeconds` (30 by default; 5 s + 20 s fits).
+- **A notification that cannot be delivered no longer holds up the others, and is no longer lost
+  silently.** 0.2.x delivered notifications one at a time per gateway: one whose network function
+  did not answer held every notification behind it for all its attempts (with the defaults, up to
+  18 s for one URI). Then it was logged and dropped.
+  - `NOTIFY_WORKERS` (32; chart `config.notify.workers`) deliver at once. Their order is not
+    kept, as it was not across replicas either.
+  - Each undelivered notification is published on `5g.data.notify.failed` as a
+    `NotificationFailure` (client v0.3.0): the payload, why (`client_error`, `exhausted`,
+    `not_allowed`, `not_implemented`), the last status and ProblemDetails, and the attempts.
+  - A network function that failed 3 times in a row rests (1 s, doubling to 30 s): the other URIs
+    of a notification go first, and 0.2.x began every notification with the primary. A
+    `Retry-After` is kept to (TS 29.500 clause 6.4), remembered for 5 minutes at most; 0.2.x did
+    not read it.
+  - A URI `OUTBOUND_ALLOWED_DESTINATIONS` refuses is not retried, and the unimplemented
+    `mtc_iwf_rest`/`scef_rest_https` profiles end the delivery at once. 0.2.x retried both in
+    every pass.
+  - On shutdown the deliveries in flight are waited for and those still running at the deadline
+    are reported; 0.2.x's drain did not wait.
+  - Callback URIs, which carry subscriber identities, are no longer logged: logs name the network
+    function (`scheme://host:port`). Per-notification lines are `debug`.
+  - Metrics: `outbound_deliveries_total` results `not_allowed` and `not_implemented`;
+    `outbound_endpoint_skips_total{reason="resting"|"retry_after"}`.
+- **Every SMS ends with `DELIVERED` or `FAILED`.** When the SMSF failed transiently on all three
+  deliveries, 0.2.x's last `DeliveryEvent` was `PENDING` and nothing followed; the message stayed in
+  the work queue. The last delivery's transient failure is now `FAILED` with cause
+  `RETRIES_EXHAUSTED`, the transient cause in `BearerMeta` `lastCause`, and the message is
+  acknowledged. Metric `sbi_gateway_ota_smsf_sends_total{result="retries_exhausted"}`.
+- **Every operation of the APIs served.** The routes come from the 3GPP Rel-17 OpenAPI definitions:
+  249 operations of Nudm_UEAU, UECM, SDM, EE, PP, MT, ReportSMDeliveryStatus and Nudr subscription
+  data. Nudm_ReportSMDeliveryStatus is new: an SMS-GMSC reports the outcome of an MT SMS to the UDM
+  through it (TS 23.540 clause 5.1.2). 0.2.x lacked, among
+  others:
+  - the non-3GPP access registrations, the UECM custom operations and IP-SM-GW and NWDAF
+    registrations;
+  - the other UEAU operations;
+  - the SDM sub-resources and shared-data subscriptions;
+  - PP's 5G VN groups;
+  - MT's UE information.
+- **Success statuses and `Location` as the specification gives them.** The application chooses among
+  the operation's success statuses: 201 with `Location` for a subscription or a new registration,
+  204 for a deletion or a modification without a body. 0.2.x answered every write of SDM, EE, PP and
+  Nudr 200.
+- **Identifiers as the specification types them.**
+  - SDM's `{ueId}` (subscriptions, identifier translation, LCS privacy data) accepts a GPSI.
+  - SUPIs may be Global Cable or Line Identifiers.
+  - PP accepts only the methods its resources have: 405 elsewhere, as for every resource.
+- **Request bodies are checked:** their media type against the operation's (415 otherwise; UECM PATCH
+  is `application/merge-patch+json`), and that they are a JSON object or array.
+- **Changes on SDM, EE, PP and Nudr are audited**, like those on UEAU, UECM and MT.
+- What matches no operation is answered with ProblemDetails (TS 29.500 Table 5.2.7.2-1); 0.2.x
+  answered chi's plain text.
+- **An MT SMS goes to the SMSF as MtForwardSm.** 0.2.x used UplinkSMS (`sendsms`), which TS 29.540
+  Table 5.2.1-1 gives to the AMF, with a JSON body.
+  - The SMS now goes out as `send-mt-sms`, the operation of the SMS-GMSC, SMS Router and IP-SM-GW,
+    with a `multipart/related` body: TS 29.577 `SmsData` and the RP-DATA as `application/vnd.3gpp.sms`.
+  - The delivery event takes its status from the mobile station's RP-ACK or RP-ERROR in the response.
+  - The application must send an RP-DATA (client v0.2.0); a bare TPDU fails.
+- **Callbacks and SMSF calls to `https://` URIs go out over HTTP/2.** 0.2.x sent them over HTTP/1.1
+  when no client certificate was configured; a peer that speaks only HTTP/1.1 is no longer called.
+- **`MTLS_OUTBOUND_CA_FILE` alone gives TLS without a client certificate**, trusting that CA; with
+  it, `http://` URIs are refused. 0.2.x stopped at start-up unless all three outbound TLS settings
+  were set.
+- **The gateway authenticates to NATS and can reach it over TLS.**
+  - Authentication: user credentials (`NATS_CREDS_FILE`), an nkey seed, a user and password, or a
+    token, with secrets read from files.
+  - TLS: TLS 1.3 with `NATS_TLS_CA_FILE` and a client certificate.
+  - Contradicting settings stop it at start-up.
+  - The chart mounts them from `config.nats.secret`.
+  - 0.2.x had only `NATS_URL`, so credentials sat in the pod spec.
+- **A port that cannot be bound, a TLS certificate that cannot be loaded, or a callback subscriber
+  that cannot start stops the gateway at start-up**, naming the cause. 0.2.x logged the error and ran
+  on, with `/health/ready` answering 200 and the SBI port closed. A server that fails later stops the
+  gateway too.
+- **A setting that does not parse stops the gateway**, naming every such variable at once. 0.2.x
+  took the default: `OAUTH_DISABLED=fasle` left OAuth off, `RATE_LIMIT_RPS=100/s` switched the rate
+  limiter off.
+- **The rate limiter's shared counter is no longer a data race.** A request over the limit is
+  answered 429 with ProblemDetails, cause `NF_CONGESTION_RISK` (TS 29.500 Table 5.2.7.2-1), and
+  `Retry-After`; 0.2.x sent `text/plain` with a cause the table does not have.
+- The `method` label of `sbi_gateway_requests_total` and `sbi_gateway_request_duration_seconds` is
+  `OTHER` for a method the SBI does not use. In 0.2.x every method a client made up opened a new time
+  series, before authentication.
 
 ## [0.2.1] — 2026-10-18
 

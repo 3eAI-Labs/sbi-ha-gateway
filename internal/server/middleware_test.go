@@ -8,7 +8,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -100,4 +103,33 @@ func TestMetricsMiddleware_PanicRecovery(t *testing.T) {
 		_ = recover() // swallow so the test doesn't fail
 	}()
 	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/boom", nil))
+}
+
+// A method the client makes up is OTHER in the metric labels, not a series of its own.
+func TestMetricsMiddleware_MethodLabelBounded(t *testing.T) {
+	r := chi.NewRouter()
+	r.Use(MetricsMiddleware)
+	r.Get("/x", func(http.ResponseWriter, *http.Request) {})
+	for _, m := range []string{"FOO1", "FOO2", "GET"} {
+		r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(m, "/x", nil))
+	}
+	for _, c := range []struct {
+		method string
+		want   bool
+	}{{"FOO1", false}, {"FOO2", false}, {"OTHER", true}, {"GET", true}} {
+		var found bool
+		ch := make(chan prometheus.Metric, 64)
+		metrics.RequestsTotal.Collect(ch)
+		close(ch)
+		for m := range ch {
+			var d dto.Metric
+			_ = m.Write(&d)
+			for _, l := range d.GetLabel() {
+				if l.GetName() == "method" && l.GetValue() == c.method {
+					found = true
+				}
+			}
+		}
+		assert.Equal(t, c.want, found, "series with method %q", c.method)
+	}
 }

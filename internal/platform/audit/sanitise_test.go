@@ -148,3 +148,21 @@ func TestSanitisePayload_OutputHasNoSecretLiterals(t *testing.T) {
 
 // Compile-time guard that the redacted marker is detectable in tests.
 var _ = reflect.DeepEqual
+
+// The subscriber keys and SQN of a TS 29.505 AuthenticationSubscription.
+func TestSanitisePayload_RedactsAuthenticationSubscription(t *testing.T) {
+	in := map[string]interface{}{
+		"authenticationMethod": "5G_AKA",
+		"encPermanentKey":      "k-secret",
+		"encOpcKey":            "opc-secret",
+		"encTopcKey":           "topc-secret",
+		"sequenceNumber":       map[string]interface{}{"sqn": "sqn-secret"},
+	}
+	raw, _ := json.Marshal(SanitisePayload(in))
+	if strings.Contains(string(raw), "secret") {
+		t.Errorf("key material survived: %s", raw)
+	}
+	if !strings.Contains(string(raw), "5G_AKA") {
+		t.Errorf("non-sensitive field lost: %s", raw)
+	}
+}

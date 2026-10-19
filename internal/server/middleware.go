@@ -10,17 +10,21 @@ import (
 	"time"
 
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/routectx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
 func RegisterMiddleware(r *chi.Mux, log *slog.Logger) {
+	// First: the handler records the operation's route here for the access log and metrics.
+	r.Use(routectx.Middleware)
 	r.Use(middleware.RequestID)
 	// No RealIP: it believed X-Forwarded-For, X-Real-IP and True-Client-IP from
 	// anyone. The client address is the TCP peer's.
 	r.Use(AccessLog(log))
-	r.Use(middleware.Recoverer)
 	r.Use(MetricsMiddleware)
+	// Inside the metrics and the access log, so that a panicked request counts as its 500.
+	r.Use(Recover(log))
 }
 
 // AccessLog logs each request through log, so LOG_LEVEL governs it like every other line.
@@ -88,8 +92,20 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 		status := strconv.Itoa(responseStatus(ww))
 		path := getRoutePattern(r)
 
-		metrics.RecordRequest(r.Method, path, status, duration)
+		metrics.RecordRequest(methodLabel(r.Method), path, status, duration)
 	})
+}
+
+// methodLabel is the method for a metric label: the client chooses the method, and any token
+// is a valid one, so a method the SBI does not use is OTHER rather than a new time series
+// per request.
+func methodLabel(m string) string {
+	switch m {
+	case http.MethodGet, http.MethodPut, http.MethodPost, http.MethodPatch, http.MethodDelete,
+		http.MethodHead, http.MethodOptions:
+		return m
+	}
+	return "OTHER"
 }
 
 // unmatchedRoute names a request no route matched, in metric labels and access lines.
@@ -103,6 +119,10 @@ const unmatchedRoute = "unmatched"
 // choice, so it could carry a subscriber identifier into logs or a new label per request
 // into the metrics.
 func getRoutePattern(r *http.Request) string {
+	// The operation's route in the specification's terms, when a handler recorded it.
+	if route := routectx.Get(r); route != "" {
+		return route
+	}
 	rctx := chi.RouteContext(r.Context())
 	if rctx == nil {
 		return unmatchedRoute

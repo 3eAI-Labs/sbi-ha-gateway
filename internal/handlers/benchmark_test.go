@@ -4,70 +4,50 @@
 package handlers_test
 
 import (
-	"bytes"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
-	sbiclient "github.com/3eAI-Labs/sbi-ha-gateway-client"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers"
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/mock"
 )
 
-func BenchmarkAuthHandler_GenerateAuthData(b *testing.B) {
+// benchmark serves method path (with body) b.N times against an application that answers
+// reply, and fails unless each request gets want: a benchmark of an error path measures
+// nothing useful.
+func benchmark(b *testing.B, method, path, body, reply string, want int) {
 	mockNats := new(MockNatsClient)
-	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	h := handlers.NewAuthHandler(logger, mockNats, 0)
-
+	mockNats.On("Request", mock.Anything, mock.Anything, mock.Anything, handlers.DefaultRequestTimeout).
+		Return([]byte(reply), nil)
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
-
-	reqBody := sbiclient.AuthenticationInfoRequest{
-		ServingNetworkName: "5G:mnc045.mcc123.3gppnetwork.org",
-		AusfInstanceId:     "ausf-1",
-	}
-	body, _ := json.Marshal(reqBody)
-
-	natsResp := sbiclient.AuthenticationInfoResult{
-		Supi: "imsi-12345",
-	}
-	natsRespBytes, _ := json.Marshal(natsResp)
-
-	mockNats.On("Request", mock.Anything, "5g.auth.request", mock.Anything, handlers.DefaultRequestTimeout).
-		Return(natsRespBytes, nil)
+	handlers.NewSBIHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)), mockNats, 0).RegisterRoutes(r)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req := httptest.NewRequest(http.MethodPost, "/nudm-ueau/v1/imsi-12345/security-information/generate-auth-data", bytes.NewBuffer(body))
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
+		if w.Code != want {
+			b.Fatalf("%s %s: %d %s", method, path, w.Code, w.Body)
+		}
 	}
 }
 
-func BenchmarkDataHandler_HandleGenericRequest(b *testing.B) {
-	mockNats := new(MockNatsClient)
-	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	h := handlers.NewDataHandler(logger, mockNats, 0)
+func BenchmarkSBI_GenerateAuthData(b *testing.B) {
+	benchmark(b, http.MethodPost, "/nudm-ueau/v1/imsi-001010000000001/security-information/generate-auth-data",
+		`{"servingNetworkName":"5G:mnc045.mcc123.3gppnetwork.org","ausfInstanceId":"ausf-1"}`,
+		`{"body":{"authType":"5G_AKA","authenticationVector":{"avType":"5G_HE_AKA","rand":"r","xresStar":"x","autn":"a","kausf":"k"}}}`,
+		http.StatusOK)
+}
 
-	r := chi.NewRouter()
-	h.RegisterRoutes(r)
-
-	natsResp := sbiclient.DataResponse{
-		Payload: json.RawMessage(`{"data":"value"}`),
-	}
-	respBytes, _ := json.Marshal(natsResp)
-
-	mockNats.On("Request", mock.Anything, mock.Anything, mock.Anything, handlers.DefaultRequestTimeout).
-		Return(respBytes, nil)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req := httptest.NewRequest(http.MethodGet, "/nudr-dr/v1/subscription-data/imsi-123/authentication-data", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-	}
+func BenchmarkSBI_GetAmData(b *testing.B) {
+	benchmark(b, http.MethodGet, "/nudm-sdm/v2/imsi-001010000000001/am-data", "",
+		`{"body":{"gpsis":["msisdn-905551112233"]}}`, http.StatusOK)
 }

@@ -32,6 +32,8 @@ podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
+  # Secret volumes are owned by root: fsGroup makes them group 65532, readable at 0440.
+  fsGroup: 65532
   seccompProfile:
     type: RuntimeDefault
 
@@ -81,37 +83,67 @@ config:
     url: ""
     connectTimeout: "5s"
     requestTimeout: "2s"
+    # Credentials and TLS for that NATS, from a Secret you provide, mounted read-only at
+    # /etc/sbi-gateway/nats. Name the keys the Secret holds and leave the others empty: one
+    # authentication (user and password, token, user credentials or nkey seed), and TLS with a
+    # CA and optionally a client certificate. Never put credentials in url: the pod spec shows it.
+    secret:
+      name: ""
+      user: ""          # with passwordKey
+      passwordKey: ""
+      tokenKey: ""
+      credsKey: ""      # user JWT and nkey seed (.creds)
+      nkeySeedKey: ""
+      caKey: ""         # CA of the NATS server's certificate: TLS
+      certKey: ""       # client certificate, with keyKey
+      keyKey: ""
 
   retry:
     maxRetries: 3
     baseDelay: "1s"
 
-  # After SIGTERM the gateway goes on serving this long, /health/ready answering 503, so that
-  # connections kube-proxy still sends to the terminating pod are answered. Drain delay plus the
-  # 5 s shutdown that follows must stay below terminationGracePeriodSeconds.
+  # Notifications delivered at once: one whose network function does not answer holds one.
+  notify:
+    workers: 32
+
+  # After SIGTERM the gateway goes on serving for drainDelay, /health/ready answering 503, so that
+  # connections kube-proxy still sends to the terminating pod are answered. Then, within timeout,
+  # the requests in flight, the notification deliveries and the SMS being sent finish. The two
+  # together must stay below terminationGracePeriodSeconds; the chart refuses to render otherwise.
   shutdown:
     drainDelay: "5s"
+    timeout: "20s"
 
   # Per-client token bucket in front of the back end. rps=0 disables the limiter.
   rateLimit:
     rps: 0
     burst: 100
 
-  # TLS/mTLS (TS 33.310). Empty cert/key ⇒ h2c cleartext HTTP/2 for internal mesh.
-  # Cert material is mounted from tls.existingSecret (never inline).
+  # Secure by default: the SBI port needs TLS (tls.existingSecret), client certificates
+  # (config.mtls) and OAuth (config.oauth) — or each one's explicit opt-out below and there.
+  # A trial install (config.nats.url empty: the bundled NATS) opts out of what it lacks, so
+  # that the chart's defaults start; with config.nats.url set, a missing protection stops
+  # the render with what to set.
+  security:
+    allowPlaintextSbi: false   # true: cleartext h2c without tls.existingSecret
+
+  # TLS/mTLS (TS 33.310). Cert material is mounted from tls.existingSecret (never inline).
   tls:
     certFile: ""
     keyFile: ""
   mtls:
     clientCAFile: ""
-    clientAuthMode: "off"   # off | optional | require
+    clientAuthMode: "require"   # off | optional | require; require needs clientCAFile
+    # Outbound TLS for callbacks and SMSF calls: file paths, mounted with extraVolumes. The CA
+    # alone is TLS without a client certificate; a certificate needs its key and the CA.
     outboundCertFile: ""
     outboundKeyFile: ""
     outboundCAFile: ""
 
-  # OAuth2 NF tokens (TS 33.501 §13.4.1). Disabled by default — opt in.
+  # OAuth2 NF tokens (TS 33.501 §13.4.1): required — set audience and nrfJwksUrl (or
+  # jwksFile), or disabled: true.
   oauth:
-    disabled: true
+    disabled: false
     audience: ""
     nrfJwksUrl: ""
     jwksFile: ""
@@ -123,8 +155,13 @@ config:
   # Delivery of data-change notifications: sbi_direct | scef_rest.
   outbound:
     profile: "sbi_direct"
+    # Hosts callbacks and SMSF calls may reach: host names, ".domain" suffixes, CIDR blocks,
+    # addresses. Checked on the address actually dialled. Empty: none. Loopback, link-local
+    # (cloud metadata) and multicast addresses only when listed by address.
+    allowedDestinations: []
+    allowAny: false   # true: any host but those always refused
 
-  # SMS (OTA) surfaces: serving-SMSF lookup and Nsmsf SendSMS. Off until opted in; needs
+  # SMS (OTA) surfaces: serving-SMSF lookup and Nsmsf MtForwardSm. Off until opted in; needs
   # config.nats.url (the stream OTA_OUTBOUND lives on the applications' NATS).
   ota:
     enabled: false
@@ -135,6 +172,21 @@ config:
   audit:
     disabled: false
     natsSubject: "audit.events"
+
+# Further volumes for files the gateway reads by path — the outbound TLS files, a JWKS file
+# (config.oauth.jwksFile), the OTA resolver (config.ota.resolverFile) — usually a Secret or a
+# ConfigMap, mounted read-only.
+extraVolumes: []
+extraVolumeMounts: []
+
+# Ingress to the gateway pods. The SBI port is reachable from sbiFrom (empty: anywhere); the
+# admin port (metrics, health, stats — no authentication) only from pods in the release's
+# namespace and from adminFrom (add your Prometheus here). Kubelet probes are not peers of a
+# NetworkPolicy on common CNIs (verified on kind's kindnet).
+networkPolicy:
+  enabled: true
+  sbiFrom: []
+  adminFrom: []
 
 # -- TLS secret (operator-provisioned; mounted at /etc/sbi-gateway/tls when set) --
 tls:

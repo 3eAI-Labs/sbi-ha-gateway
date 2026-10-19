@@ -31,38 +31,49 @@ import (
 
 const itSupi = "imsi-001010000000001"
 
-// One call per NATS request in the handlers. audited: the handler emits an audit event on
-// success.
+// One call per NATS subject and kind of reply. reply is what the application answers when
+// it accepts the operation; audited: the gateway emits an audit event on success.
 var itCalls = []struct {
-	method, path, body string
-	audited            bool
+	method, path, contentType, body string
+	operation, reply                string
+	audited                         bool
 }{
-	{"POST", "/nudm-ueau/v1/" + itSupi + "/security-information/generate-auth-data", `{"servingNetworkName":"5G:mnc001.mcc001.3gppnetwork.org","ausfInstanceId":"ausf-1"}`, true},
-	{"POST", "/nudm-ueau/v1/" + itSupi + "/auth-events", `{"nfInstanceId":"ausf-1","success":true,"timeStamp":"2026-10-17T10:00:00Z","authType":"5G_AKA","servingNetworkName":"sn"}`, true},
-	{"PUT", "/nudm-uecm/v1/" + itSupi + "/registrations/amf-3gpp-access", `{"amfInstanceId":"amf-1","ratType":"NR","deregCallbackUri":"http://amf/cb","guami":{"plmnId":{"mcc":"001","mnc":"01"},"amfId":"cafe00"}}`, true},
-	{"PATCH", "/nudm-uecm/v1/" + itSupi + "/registrations/amf-3gpp-access", `{"purgeFlag":true}`, true},
-	{"GET", "/nudm-uecm/v1/" + itSupi + "/registrations/amf-3gpp-access", ``, false},
-	{"PUT", "/nudm-uecm/v1/" + itSupi + "/registrations/smf-registrations/5", `{"smfInstanceId":"smf-1","pduSessionId":5,"singleNssai":{"sst":1},"dnn":"internet","plmnId":{"mcc":"001","mnc":"01"}}`, true},
-	{"PATCH", "/nudm-uecm/v1/" + itSupi + "/registrations/smf-registrations/5", `{"pgwFqdn":"pgw.example"}`, true},
-	{"DELETE", "/nudm-uecm/v1/" + itSupi + "/registrations/smf-registrations/5", ``, true},
-	{"PUT", "/nudm-uecm/v1/" + itSupi + "/registrations/smsf-3gpp-access", `{"smsfInstanceId":"smsf-1"}`, true},
-	{"GET", "/nudm-uecm/v1/" + itSupi + "/registrations/smsf-3gpp-access", ``, false},
-	{"DELETE", "/nudm-uecm/v1/" + itSupi + "/registrations/smsf-3gpp-access", ``, true},
-	{"GET", "/nudm-uecm/v1/" + itSupi + "/registrations", ``, false},
-	{"POST", "/nudm-mt/v1/" + itSupi + "/loc-info/provide-loc-info", `{"req5gsLoc":true}`, true},
-	{"GET", "/nudr-dr/v1/subscription-data/" + itSupi + "/authentication-data/authentication-subscription", ``, false},
-	{"PUT", "/nudr-dr/v1/subscription-data/" + itSupi + "/context-data/amf-3gpp-access", `{"amfInstanceId":"amf-1"}`, false},
-}
-
-// itReplies is what an application answers on each request subject.
-var itReplies = map[string]string{
-	sbiclient.SubjectAuthRequest:          `{"authVector":{"rand":"r","autn":"a","xresStar":"x","kAusf":"k"}}`,
-	sbiclient.SubjectAuthConfirm:          `{"authEventId":"ev-1"}`,
-	sbiclient.SubjectMobilityRegistration: `{}`,
-	sbiclient.SubjectMobilityQuery:        `{"amf3GppAccessRegistration":{"amfInstanceId":"amf-1"}}`,
-	sbiclient.SubjectLocationInfo:         `{"currentLoc":true}`,
-	sbiclient.SubjectDataQuery:            `{"payload":{"a":1}}`,
-	sbiclient.SubjectDataUpdate:           `{}`,
+	{"POST", "/nudm-ueau/v1/" + itSupi + "/security-information/generate-auth-data", "application/json",
+		`{"servingNetworkName":"5G:mnc001.mcc001.3gppnetwork.org","ausfInstanceId":"ausf-1"}`,
+		"GenerateAuthData", `{"body":{"authType":"5G_AKA","authenticationVector":{"avType":"5G_HE_AKA","rand":"r","xresStar":"x","autn":"a","kausf":"k"}}}`, true},
+	{"POST", "/nudm-ueau/v1/" + itSupi + "/auth-events", "application/json",
+		`{"nfInstanceId":"ausf-1","success":true,"timeStamp":"2026-10-17T10:00:00Z","authType":"5G_AKA","servingNetworkName":"sn"}`,
+		"ConfirmAuth", `{"resourceId":"ev-1","body":{"nfInstanceId":"ausf-1","success":true}}`, true},
+	{"PUT", "/nudm-uecm/v1/" + itSupi + "/registrations/amf-3gpp-access", "application/json",
+		`{"amfInstanceId":"amf-1","ratType":"NR","deregCallbackUri":"http://amf/cb","guami":{"plmnId":{"mcc":"001","mnc":"01"},"amfId":"cafe00"}}`,
+		"3GppRegistration", `{"status":201,"body":{"amfInstanceId":"amf-1"}}`, true},
+	{"PATCH", "/nudm-uecm/v1/" + itSupi + "/registrations/amf-3gpp-access", "application/merge-patch+json",
+		`{"purgeFlag":true}`, "Update3GppRegistration", `{"status":204}`, true},
+	{"GET", "/nudm-uecm/v1/" + itSupi + "/registrations/amf-3gpp-access", "", ``,
+		"Get3GppRegistration", `{"body":{"amfInstanceId":"amf-1"}}`, false},
+	{"PUT", "/nudm-uecm/v1/" + itSupi + "/registrations/smf-registrations/5", "application/json",
+		`{"smfInstanceId":"smf-1","pduSessionId":5,"singleNssai":{"sst":1},"dnn":"internet","plmnId":{"mcc":"001","mnc":"01"}}`,
+		"Registration", `{"status":201,"body":{"smfInstanceId":"smf-1"}}`, true},
+	{"DELETE", "/nudm-uecm/v1/" + itSupi + "/registrations/smf-registrations/5", "", ``,
+		"SmfDeregistration", `{}`, true},
+	{"GET", "/nudm-uecm/v1/" + itSupi + "/registrations", "", ``,
+		"GetRegistrations", `{"body":{"amf3Gpp":{"amfInstanceId":"amf-1"}}}`, false},
+	{"POST", "/nudm-mt/v1/" + itSupi + "/loc-info/provide-loc-info", "application/json", `{"req5gsLoc":true}`,
+		"ProvideLocationInfo", `{"body":{"currentLoc":true}}`, true},
+	{"GET", "/nudm-sdm/v2/" + itSupi + "/am-data", "", ``,
+		"GetAmData", `{"body":{"gpsis":["msisdn-905551112233"]}}`, false},
+	{"POST", "/nudm-sdm/v2/" + itSupi + "/sdm-subscriptions", "application/json",
+		`{"nfInstanceId":"amf-1","callbackReference":"http://amf/cb","monitoredResourceUris":["/am-data"]}`,
+		"Subscribe", `{"resourceId":"sub-1","body":{"nfInstanceId":"amf-1"}}`, true},
+	{"GET", "/nudr-dr/v2/subscription-data/" + itSupi + "/authentication-data/authentication-subscription", "", ``,
+		"QueryAuthSubsData", `{"body":{"authenticationMethod":"5G_AKA"}}`, false},
+	{"PUT", "/nudr-dr/v2/subscription-data/" + itSupi + "/context-data/amf-3gpp-access", "application/json",
+		`{"amfInstanceId":"amf-1"}`, "CreateAmfContext3gpp", `{"status":204}`, true},
+	// Subscriber key material in a JSON Patch: audited, but never into the audit event.
+	{"PATCH", "/nudr-dr/v2/subscription-data/" + itSupi + "/authentication-data/authentication-subscription",
+		"application/json-patch+json",
+		`[{"op":"replace","path":"/encPermanentKey","value":"SECRET-K"},{"op":"replace","path":"/sequenceNumber","value":{"sqn":"SECRET-SQN"}}]`,
+		"ModifyAuthenticationSubscription", `{"status":204}`, true},
 }
 
 const itTimeout = 200 * time.Millisecond
@@ -90,28 +101,35 @@ func TestHandlers_RealNATS(t *testing.T) {
 	nc := client.GetConn()
 
 	var audited atomic.Int64
-	_, err = nc.Subscribe("audit.test", func(*gnats.Msg) { audited.Add(1) })
+	var leaked atomic.Int64 // audit events carrying a request body's secret
+	_, err = nc.Subscribe("audit.test", func(m *gnats.Msg) {
+		audited.Add(1)
+		if strings.Contains(string(m.Data), "SECRET") {
+			leaked.Add(1)
+		}
+	})
 	require.NoError(t, err)
 	cgaudit.SetPublisher(nc, "audit.test")
 	defer cgaudit.SetPublisher(nil, "")
 
 	r := chi.NewRouter()
-	handlers.NewAuthHandler(log, client, itTimeout).RegisterRoutes(r)
-	handlers.NewMobilityHandler(log, client, itTimeout).RegisterRoutes(r)
-	handlers.NewMTHandler(log, client, itTimeout).RegisterRoutes(r)
-	handlers.NewDataHandler(log, client, itTimeout).RegisterRoutes(r)
+	handlers.NewSBIHandler(log, client, itTimeout).RegisterRoutes(r)
 
 	// A network function that gives up after 2 s, so that a request the gateway does not
 	// time out itself fails the test instead of hanging it.
-	serve := func(method, path, body string) *httptest.ResponseRecorder {
+	serve := func(method, path, contentType, body string) *httptest.ResponseRecorder {
 		var rd io.Reader
 		if body != "" {
 			rd = bytes.NewBufferString(body)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
+		req := httptest.NewRequest(method, path, rd).WithContext(ctx)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
 		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, httptest.NewRequest(method, path, rd).WithContext(ctx))
+		r.ServeHTTP(rec, req)
 		return rec
 	}
 	// noAudit checks that a phase emitted no audit event. Events go out through a queue;
@@ -122,18 +140,27 @@ func TestHandlers_RealNATS(t *testing.T) {
 	}
 
 	t.Run("results", func(t *testing.T) {
-		app, err := nc.Subscribe("5g.>", func(m *gnats.Msg) { _ = m.Respond([]byte(itReplies[m.Subject])) })
+		replies := map[string]string{}
+		for _, c := range itCalls {
+			replies[c.operation] = c.reply
+		}
+		app, err := nc.Subscribe("5g.>", func(m *gnats.Msg) {
+			var req sbiclient.Request
+			_ = json.Unmarshal(m.Data, &req)
+			_ = m.Respond([]byte(replies[req.Operation]))
+		})
 		require.NoError(t, err)
 		defer func() { require.NoError(t, app.Unsubscribe()) }()
 		var want int64
 		for _, c := range itCalls {
-			rec := serve(c.method, c.path, c.body)
+			rec := serve(c.method, c.path, c.contentType, c.body)
 			assert.Less(t, rec.Code, 300, "%s %s: %s", c.method, c.path, rec.Body.String())
 			if c.audited {
 				want++
 			}
 		}
 		require.Eventually(t, func() bool { return audited.Load() == want }, 5*time.Second, 20*time.Millisecond)
+		assert.Zero(t, leaked.Load(), "audit events with key material")
 	})
 
 	t.Run("error reply", func(t *testing.T) {
@@ -143,7 +170,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 		defer func() { require.NoError(t, app.Unsubscribe()) }()
 		before := audited.Load()
 		for _, c := range itCalls {
-			rec := serve(c.method, c.path, c.body)
+			rec := serve(c.method, c.path, c.contentType, c.body)
 			assert.Equal(t, http.StatusNotFound, rec.Code, "%s %s", c.method, c.path)
 			assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"), "%s %s", c.method, c.path)
 			assert.JSONEq(t, problem, rec.Body.String(), "%s %s", c.method, c.path)
@@ -158,7 +185,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 		before := audited.Load()
 		for _, c := range itCalls {
 			start := time.Now()
-			rec := serve(c.method, c.path, c.body)
+			rec := serve(c.method, c.path, c.contentType, c.body)
 			elapsed := time.Since(start)
 			assertProblem(t, rec, http.StatusGatewayTimeout, "TARGET_NF_NOT_REACHABLE", c.method+" "+c.path)
 			assert.GreaterOrEqual(t, elapsed, itTimeout, "%s %s", c.method, c.path)
@@ -171,7 +198,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 		before := audited.Load()
 		for _, c := range itCalls {
 			start := time.Now()
-			rec := serve(c.method, c.path, c.body)
+			rec := serve(c.method, c.path, c.contentType, c.body)
 			assertProblem(t, rec, http.StatusGatewayTimeout, "TARGET_NF_NOT_REACHABLE", c.method+" "+c.path)
 			assert.Less(t, time.Since(start), itTimeout, "%s %s: no responders is known at once", c.method, c.path)
 		}
@@ -185,7 +212,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 		require.NoError(t, err)
 		before := audited.Load()
 		for _, c := range itCalls {
-			rec := serve(c.method, c.path, c.body)
+			rec := serve(c.method, c.path, c.contentType, c.body)
 			assertProblem(t, rec, http.StatusInternalServerError, "SYSTEM_FAILURE", c.method+" "+c.path)
 			assert.False(t, strings.Contains(rec.Body.String(), "CORE_EVENTS"), "stream name in the problem detail")
 		}

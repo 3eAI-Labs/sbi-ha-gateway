@@ -6,6 +6,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"net/http"
 
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/sbi"
 )
@@ -39,6 +40,18 @@ func (c *sbiDirectClient) Send(ctx context.Context, req *Request) (*Response, er
 	if req.CallbackURI == "" {
 		// CallbackURI resolution via NRF is a follow-up; today we require it from the caller.
 		return nil, errors.New("outbound: CallbackURI is required for sbi_direct profile")
+	}
+
+	if req.Multipart != nil {
+		parts, err := c.http.PostMultipart(ctx, req.CallbackURI, *req.Multipart)
+		if err != nil {
+			var httpErr *sbi.HTTPError
+			if errors.As(err, &httpErr) {
+				return &Response{StatusCode: httpErr.StatusCode, Body: httpErr.Body}, err
+			}
+			return nil, err
+		}
+		return &Response{StatusCode: http.StatusOK, Multipart: parts}, nil
 	}
 
 	if err := c.http.SendCallback(ctx, req.CallbackURI, req.Payload); err != nil {

@@ -6,6 +6,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/authctx"
@@ -93,4 +94,41 @@ func TestNFKey_PrefersOAuthSubject(t *testing.T) {
 	req.RemoteAddr = "10.1.2.3:1234"
 	req = req.WithContext(authctx.WithNFSubject(req.Context(), "AMF-real-uuid"))
 	assert.Equal(t, "AMF-real-uuid", nfKey(req))
+}
+
+// Concurrent requests share the limiter's sweep counter: under -race, 0.2.x's unsynchronised
+// increment is a data race.
+func TestNFRateLimit_ConcurrentRequests(t *testing.T) {
+	h := NFRateLimitMiddleware(1e6, 1e6)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.Header.Set("User-Agent", "AMF-1")
+				h.ServeHTTP(httptest.NewRecorder(), req)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// A 429 is ProblemDetails with TS 29.500's cause for it, and Retry-After.
+func TestNFRateLimit_ProblemDetails(t *testing.T) {
+	h := NFRateLimitMiddleware(0.0001, 1)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	var rec *httptest.ResponseRecorder
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("User-Agent", "AMF-1")
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+	}
+	assert.Equal(t, http.StatusTooManyRequests, rec.Code)
+	assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.JSONEq(t, `{"title":"Too Many Requests","status":429,"cause":"NF_CONGESTION_RISK","detail":"Request rate above this client's limit"}`, rec.Body.String())
 }

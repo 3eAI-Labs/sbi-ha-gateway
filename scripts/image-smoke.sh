@@ -37,7 +37,11 @@ fail() {
 }
 
 docker run -d --name "$NATS" "$NATS_IMAGE" >/dev/null
-docker run -d --name "$GW" --network "container:$NATS" "$IMAGE" >/dev/null
+# The gateway is secure by default; the smoke test runs it in cleartext without OAuth, each
+# opt-out explicit.
+docker run -d --name "$GW" --network "container:$NATS" \
+  -e ALLOW_PLAINTEXT_SBI=true -e MTLS_CLIENT_AUTH_MODE=off -e OAUTH_DISABLED=true \
+  "$IMAGE" >/dev/null
 
 code=000
 for ((i = 0; i < READY_TIMEOUT; i += 2)); do

@@ -75,3 +75,15 @@ bundled NATS, else a render error. */}}
 {{- fail "config.nats.url is required when nats.deploy=false: set it to the NATS your applications use." -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Milliseconds in a duration value: "500ms", "5s", "1m", "1h" (the forms the schema admits).
+*/}}
+{{- define "sbi-ha-gateway.ms" -}}
+{{- $v := toString . -}}
+{{- if hasSuffix "ms" $v -}}{{ trimSuffix "ms" $v | int64 }}
+{{- else if hasSuffix "s" $v -}}{{ mul (trimSuffix "s" $v | int64) 1000 }}
+{{- else if hasSuffix "m" $v -}}{{ mul (trimSuffix "m" $v | int64) 60000 }}
+{{- else -}}{{ mul (trimSuffix "h" $v | int64) 3600000 }}
+{{- end -}}
+{{- end -}}

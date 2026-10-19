@@ -18,6 +18,24 @@ type AdminServer struct {
 	Nats nats.INatsClient
 
 	draining atomic.Bool
+	checks   []func() bool // more conditions of readiness; added before serving
+}
+
+// AddReadinessCheck adds a condition /health/ready requires. Call it before the server serves.
+func (s *AdminServer) AddReadinessCheck(ready func() bool) {
+	s.checks = append(s.checks, ready)
+}
+
+func (s *AdminServer) ready() bool {
+	if s.draining.Load() || s.Nats == nil || !s.Nats.IsConnected() {
+		return false
+	}
+	for _, check := range s.checks {
+		if !check() {
+			return false
+		}
+	}
+	return true
 }
 
 func NewAdminServer(nc nats.INatsClient) *AdminServer {
@@ -42,7 +60,7 @@ func (s *AdminServer) SetupRouter() *chi.Mux {
 	})
 
 	r.Get("/health/ready", func(w http.ResponseWriter, r *http.Request) {
-		if !s.draining.Load() && s.Nats != nil && s.Nats.IsConnected() {
+		if s.ready() {
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)

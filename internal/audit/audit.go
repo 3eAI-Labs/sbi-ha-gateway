@@ -28,11 +28,12 @@ import (
 // Log emits an audit event for a state-changing SBI operation.
 //
 //	r        — the inbound HTTP request; used to extract the OAuth sub claim
-//	action   — verb, e.g. "REGISTER" / "UPDATE" / "DEREGISTER" / "GENERATE_AUTH_DATA"
+//	action   — the operation, by its OpenAPI operationId: "3GppRegistration", "ConfirmAuth"
 //	resource — service short name, e.g. "nudm-uecm" / "nausf-auth"
 //	supi     — raw SUPI (will be MaskSUPI'd before emission); empty for ops
 //	           without an obvious subject identifier
-//	payload  — request body or relevant struct (will be SanitisePayload'd)
+//	payload  — what the event may carry besides (will be SanitisePayload'd); the SBI
+//	           handler passes nil: it does not interpret bodies, so it cannot vouch for one
 //
 // Emit is non-blocking: when the publisher queue is full the event is
 // dropped and the audit_events_total{result="dropped"} metric increments.

@@ -51,6 +51,17 @@ var (
 		[]string{"subject"},
 	)
 
+	// SecurityProtection is 1 for each protection of the SBI port that is on, 0 for one an
+	// explicit setting switched off: tls, client_certificate, oauth. Alert on 0 in production.
+	SecurityProtection = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "sbi_gateway",
+			Name:      "security_protection",
+			Help:      "1 when the SBI protection is on, 0 when an explicit setting switched it off",
+		},
+		[]string{"protection"},
+	)
+
 	// NatsConnectionStatus indicates NATS connection state (1=connected, 0=disconnected)
 	NatsConnectionStatus = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -103,7 +114,44 @@ var (
 
 	// OutboundDeliveries counts outbound notification delivery outcomes per
 	// profile. The `result` label is bounded to a small enum so cardinality
-	// stays predictable: ok | failover | exhausted | client_error | bypassed.
+	// stays predictable: ok | failover | bypassed | exhausted | client_error |
+	// not_allowed | not_implemented.
+	// OAuthJWKSRefreshes counts fetches of the NRF's JWKS: result ok or error.
+	OAuthJWKSRefreshes = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "sbi_gateway",
+			Name:      "oauth_jwks_refreshes_total",
+			Help:      "Fetches of the NRF's JWKS by result",
+		},
+		[]string{"result"},
+	)
+
+	// OAuthJWKSKeys is the number of verification keys (RS256/ES256) the gateway holds: 0
+	// means every token is rejected.
+	OAuthJWKSKeys = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "sbi_gateway",
+		Name:      "oauth_jwks_keys",
+		Help:      "Verification keys held; 0 rejects every token",
+	})
+
+	// OAuthJWKSLastRefresh is the time of the last successful JWKS fetch.
+	OAuthJWKSLastRefresh = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "sbi_gateway",
+		Name:      "oauth_jwks_last_refresh_timestamp_seconds",
+		Help:      "Unix time of the last successful fetch of the NRF's JWKS",
+	})
+
+	// OutboundEndpointSkips counts callback URIs not called: reason "resting" (its network
+	// function failed repeatedly and another endpoint was available) or "retry_after".
+	OutboundEndpointSkips = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "sbi_gateway",
+			Name:      "outbound_endpoint_skips_total",
+			Help:      "Callback URIs not called because their network function rests or asked to wait (Retry-After)",
+		},
+		[]string{"reason"},
+	)
+
 	OutboundDeliveries = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "sbi_gateway",
@@ -141,8 +189,8 @@ var (
 	)
 
 	// OtaSmsfSends counts Nsmsf_SMService SendSMS attempts dispatched via
-	// the JetStream consumer. result: delivered | failed | client_error |
-	// bypassed | not_implemented.
+	// the JetStream consumer. result: delivered | pending | failed | retries_exhausted |
+	// client_error | bypassed | not_implemented.
 	OtaSmsfSends = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "sbi_gateway",
@@ -227,9 +275,31 @@ func RecordOAuthValidation(result, reason string) {
 
 // RecordOutboundDelivery records the outcome of one outbound delivery
 // attempt set (i.e., one pass through the failover loop, possibly retried).
-// result is one of: ok | failover | exhausted | client_error | bypassed.
+// result is one of: ok | failover | bypassed | exhausted | client_error | not_allowed |
+// not_implemented.
 func RecordOutboundDelivery(profile, result string) {
 	OutboundDeliveries.WithLabelValues(profile, result).Inc()
+}
+
+// RecordJWKSRefresh counts a fetch of the NRF's JWKS and, when it succeeded, stamps its time.
+func RecordJWKSRefresh(ok bool) {
+	if !ok {
+		OAuthJWKSRefreshes.WithLabelValues("error").Inc()
+		return
+	}
+	OAuthJWKSRefreshes.WithLabelValues("ok").Inc()
+	OAuthJWKSLastRefresh.SetToCurrentTime()
+}
+
+// SetJWKSKeys records how many verification keys the gateway holds.
+func SetJWKSKeys(n int) {
+	OAuthJWKSKeys.Set(float64(n))
+}
+
+// RecordOutboundEndpointSkip counts a callback URI not called; reason is resting or
+// retry_after.
+func RecordOutboundEndpointSkip(reason string) {
+	OutboundEndpointSkips.WithLabelValues(reason).Inc()
 }
 
 // RecordOutboundPosition observes which endpoint index (0=primary) delivered.
@@ -256,4 +326,13 @@ func RecordOtaDeliveryEvent(status string) {
 // result is one of: emitted | dropped.
 func RecordAuditEvent(result string) {
 	AuditEvents.WithLabelValues(result).Inc()
+}
+
+// SetSecurityProtection records whether protection is on.
+func SetSecurityProtection(protection string, on bool) {
+	if on {
+		SecurityProtection.WithLabelValues(protection).Set(1)
+	} else {
+		SecurityProtection.WithLabelValues(protection).Set(0)
+	}
 }

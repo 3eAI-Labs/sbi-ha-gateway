@@ -70,11 +70,20 @@ sbi:mtlsClientCAFile a owl:DatatypeProperty ;
     rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string ;
     rdfs:label "inbound peer-CA bundle path (config.mtls.clientCAFile)" .
 sbi:mtlsOutboundCertFile a owl:DatatypeProperty ;
-    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string .
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string ;
+    rdfs:label "outbound client certificate path (config.mtls.outboundCertFile)" .
 sbi:mtlsOutboundKeyFile a owl:DatatypeProperty ;
-    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string .
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string ;
+    rdfs:label "outbound client key path (config.mtls.outboundKeyFile)" .
 sbi:mtlsOutboundCAFile a owl:DatatypeProperty ;
-    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string .
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string ;
+    rdfs:label "outbound trust anchor path (config.mtls.outboundCAFile)" .
+sbi:allowPlaintextSbi a owl:DatatypeProperty ;
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:boolean ;
+    rdfs:label "cleartext SBI port opt-out (config.security.allowPlaintextSbi)" .
+sbi:outboundAllowAny a owl:DatatypeProperty ;
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:boolean ;
+    rdfs:label "outbound destination allowlist opt-out (config.outbound.allowAny)" .
 sbi:oauthDisabled a owl:DatatypeProperty ;
     rdfs:domain sbi:ProductConfig ; rdfs:range xsd:boolean ;
     rdfs:label "OAuth2 NF-token auth kill switch (config.oauth.disabled)" .

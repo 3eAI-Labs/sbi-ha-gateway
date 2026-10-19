@@ -4,13 +4,16 @@
 package server
 
 import (
+	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/models"
 	"golang.org/x/time/rate"
 )
 
@@ -78,7 +81,7 @@ func NFRateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handl
 		return func(next http.Handler) http.Handler { return next }
 	}
 	limiter := newNFRateLimiter(rps, burst)
-	var counter uint64
+	var counter atomic.Uint64 // shared by every request
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -86,20 +89,32 @@ func NFRateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handl
 
 			if !limiter.allow(key) {
 				metrics.RecordError("rate_limit", "rejected")
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, `{"status":429,"cause":"REQUEST_REJECTED"}`, http.StatusTooManyRequests)
+				writeTooManyRequests(w)
 				return
 			}
 
 			// Sweep stale buckets every ~1024 requests; cheap and predictable.
-			counter++
-			if counter%1024 == 0 {
+			if counter.Add(1)%1024 == 0 {
 				go limiter.gc()
 			}
 
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// writeTooManyRequests answers 429 with ProblemDetails, cause NF_CONGESTION_RISK (TS 29.500
+// Table 5.2.7.2-1), and Retry-After.
+func writeTooManyRequests(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(models.ProblemDetails{
+		Status: http.StatusTooManyRequests,
+		Title:  http.StatusText(http.StatusTooManyRequests),
+		Cause:  "NF_CONGESTION_RISK",
+		Detail: "Request rate above this client's limit",
+	})
 }
 
 // nfKey extracts a stable per-NF identifier from the request.

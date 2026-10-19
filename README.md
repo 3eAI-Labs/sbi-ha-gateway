@@ -9,7 +9,7 @@ SMS platform.
 The gateway keeps no subscriber state. Replicas share the work through NATS queue groups and a
 JetStream work queue, so it scales horizontally.
 
-**Status: 0.2.1; 0.2.0 was the first public release.** It has not carried traffic on a production network.
+**Status: 0.3.0; 0.2.0 was the first public release.** It has not carried traffic on a production network.
 Read [Known limitations](#known-limitations) before relying on it.
 
 ## How it works
@@ -22,7 +22,7 @@ Read [Known limitations](#known-limitations) before relying on it.
    │      sbi-ha-gateway      │ ────────────────────────────────┘
    │  OAuth2 · mTLS · limits  │ ◀── 5g.data.notify, sbi.outbound.* (SMS)
    └──────────────────────────┘
-            │  HTTP/2 POST to callback URIs, Nsmsf SendSMS to the SMSF
+            │  HTTP/2 POST to callback URIs, Nsmsf MtForwardSm to the SMSF
             ▼
    network functions, SMSF
 ```
@@ -31,7 +31,10 @@ Read [Known limitations](#known-limitations) before relying on it.
   subject. The application's reply becomes the HTTP response.
 - **Application → network function.** A message on `5g.data.notify` is POSTed to its callback URI,
   failing over to alternate URIs on 5xx, 429 or transport errors, in up to `MAX_RETRIES` passes
-  with backoff. A 4xx ends the delivery.
+  with backoff. A 4xx ends the delivery. `NOTIFY_WORKERS` notifications go out at once. A network
+  function that keeps failing rests while its alternates are tried, and one that answered
+  `Retry-After` is not called before then. A notification no network function got is reported on
+  `5g.data.notify.failed`, with the last answer.
 - **SMS (opt-in, `OTA_ENABLED`).** An SMS platform asks which SMSF serves a subscriber
   (`sbi.outbound.nudm.uecm.request`) and sends SMS through it
   (`sbi.outbound.nsmsf.send.request`, a JetStream work queue); the gateway reports each result on
@@ -43,34 +46,43 @@ link under any licence.
 
 ## Operations served
 
-| Service | Method and path | NATS subject |
-|---------|-----------------|--------------|
-| Nudm_UEAU | `POST /nudm-ueau/v1/{supiOrSuci}/security-information/generate-auth-data` | `5g.auth.request` |
-| Nudm_UEAU | `POST /nudm-ueau/v1/{supi}/auth-events` | `5g.auth.confirm` |
-| Nudm_UECM | `GET /nudm-uecm/v1/{ueId}/registrations` | `5g.mobility.query` |
-| Nudm_UECM | `GET`, `PUT`, `PATCH /nudm-uecm/v1/{ueId}/registrations/amf-3gpp-access` | `5g.mobility.query` (GET) or `5g.mobility.registration` |
-| Nudm_UECM | `GET /nudm-uecm/v1/{ueId}/registrations/smf-registrations` | `5g.mobility.query` |
-| Nudm_UECM | `GET`, `PUT`, `PATCH`, `DELETE /nudm-uecm/v1/{ueId}/registrations/smf-registrations/{pduSessionId}` | `5g.mobility.query` (GET) or `5g.mobility.registration` |
-| Nudm_UECM | `GET`, `PUT`, `DELETE /nudm-uecm/v1/{ueId}/registrations/smsf-3gpp-access` | `5g.mobility.query` (GET) or `5g.mobility.registration` |
-| Nudm_MT | `POST /nudm-mt/v1/{supi}/loc-info/provide-loc-info` | `5g.mt.loc-info` |
-| Nudm_SDM | `GET /nudm-sdm/v1/{supi}`, `GET /nudm-sdm/v1/{supi}/{dataSet}`, `GET /nudm-sdm/v1/shared-data` | `5g.data.query` |
-| Nudm_SDM | any method on `/nudm-sdm/v1/{supi}/sdm-subscriptions…` | `5g.data.query` (GET) or `5g.data.update` |
-| Nudm_PP | any method on `/nudm-pp/v1/{ueId}/pp-data` | `5g.data.query` (GET) or `5g.data.update` |
-| Nudm_EE | any method on `/nudm-ee/v1/{ueIdentity}/ee-subscriptions…` | `5g.data.query` (GET) or `5g.data.update` |
-| Nudr_DR | `GET /nudr-dr/v1/{dataSet}/{ueId}`, `GET …/shared-data`, `GET …/shared-data/{sharedDataId}`, any method on `/nudr-dr/v1/{dataSet}/{ueId}/…` | `5g.data.query` (GET) or `5g.data.update` |
+Every operation of these APIs, as the 3GPP Rel-17 OpenAPI definitions give them (TS 29.503 v17.22.0
+and earlier corrections per API, TS 29.504 v17.21.0, TS 29.505 v17.13.0):
 
-Each URI variable accepts the identifiers TS 29.503 and TS 29.505 give it: a SUPI (`imsi-<5–15
-digits>` or `nai-<user>@<realm>`) for `{supi}`; a SUPI or a SUCI for `{supiOrSuci}`; for `{ueId}`
-a SUPI (UECM PUT, PATCH, DELETE), a SUPI or a GPSI (`msisdn-<5–15 digits>`, `extid-<id>@<domain>`;
-UECM GET, Nudr), or also an External Group Id (`extgroupid-<id>@<domain>`; PP); for `{ueIdentity}`
-a GPSI, an External Group Id or `anyUE` (EE). `<id>` and `<domain>` take letters, digits and
-`.`, `_`, `~`, `+`, `-` only, and `{pduSessionId}` is 0–255. Anything else is answered 400
-`MANDATORY_IE_INCORRECT`, with the variable in `invalidParams`, before NATS is involved; a data
-resource path with a `.` or `..` segment or an escaped `/` is answered 404.
+| API | Root | Operations | NATS subject |
+|-----|------|-----------:|--------------|
+| Nudm_UEAuthentication | `/nudm-ueau/v1` | 7 | `5g.auth.confirm` for auth-events, `5g.auth.request` for the others |
+| Nudm_UEContextManagement | `/nudm-uecm/v1` | 31 | `5g.mobility.query` for reads, `5g.mobility.registration` for changes |
+| Nudm_SubscriberDataManagement | `/nudm-sdm/v2` | 35 | `5g.data.query` (GET) or `5g.data.update` |
+| Nudm_EventExposure | `/nudm-ee/v1` | 3 | `5g.data.query` (GET) or `5g.data.update` |
+| Nudm_ParameterProvision | `/nudm-pp/v1` | 12 | `5g.data.query` (GET) or `5g.data.update` |
+| Nudm_MT | `/nudm-mt/v1` | 2 | `5g.mt.loc-info` |
+| Nudm_ReportSMDeliveryStatus | `/nudm-rsds/v1` | 1 | `5g.data.update` |
+| Nudr_DataRepository, subscription data | `/nudr-dr/v2/subscription-data` | 158 | `5g.data.query` (GET) or `5g.data.update` |
 
-A PUT of a registration is answered 201 with `Location` when the application created it, 200 when
-it replaced one; auth-events is answered 201 with `Location` ending in the `authEventId` the
-application assigned.
+For each call the gateway checks, before NATS is involved:
+
+- **The URI.** An API or API version it does not serve is answered 400 `INVALID_API`, an unknown
+  resource of one it serves 404 `RESOURCE_URI_STRUCTURE_NOT_FOUND`, a method the resource does not
+  have 405 with `Allow`.
+- **The UE identifiers in it**, against the kinds the variable's schema names:
+  - a SUPI: `imsi-<5–15 digits>`, `nai-<user>@<realm>`, `gci-…` or `gli-…`;
+  - a SUCI;
+  - a GPSI: `msisdn-<5–15 digits>` or `extid-<id>@<domain>`;
+  - an External Group Id: `extgroupid-<id>@<domain>`;
+  - `anyUE`.
+
+  Identifiers take letters, digits and `.`, `_`, `~`, `+`, `-` only, and `{pduSessionId}` is 0–255.
+  Anything else is answered 400 `MANDATORY_IE_INCORRECT`, with the variable in `invalidParams`.
+  Another path variable with a `.` or `..` segment or an escaped `/` is answered 404.
+- **The body:** a JSON object or array of a media type the operation accepts, otherwise:
+  - 415 for another media type;
+  - 400 `INVALID_MSG_FORMAT` for a body that is not a JSON object or array;
+  - 413 above 1 MiB.
+
+The application gets the operation by its operationId with the body unchanged. It answers with the
+status, the body and, for a created resource, its identifier. The gateway answers the network function
+with that status if the operation allows it, and builds `Location` from the request URI.
 
 An application answers each request with the operation's result or with an error reply,
 `{"problemDetails": {...}}`, which the network function receives with its status as the HTTP status
@@ -99,14 +111,49 @@ The gateway is configured through environment variables only (below) and needs a
 ### Helm
 
 ```bash
-helm install sbi oci://ghcr.io/3eai-labs/charts/sbi-ha-gateway --version 0.2.1 \
-  --set config.nats.url=nats://nats.example:4222
+helm install sbi oci://ghcr.io/3eai-labs/charts/sbi-ha-gateway --version <version> \
+  --set config.nats.url=nats://nats.example:4222 \
+  --set tls.existingSecret=sbi-tls --set config.mtls.clientCAFile=ca.crt \
+  --set config.oauth.audience=<nf-instance-id> --set config.oauth.nrfJwksUrl=https://nrf.example/jwks
 ```
 
-Without `config.nats.url` the chart deploys its own single-replica core NATS so that a trial install
-becomes Ready. No application is connected to it, so every request then times out — set
-`config.nats.url` to the NATS your applications use. The chart runs under the Kubernetes `restricted`
-Pod Security Standard. `values.schema.json` documents every value.
+The gateway is secure by default. Its SBI port needs:
+- TLS: `tls.existingSecret`, a Secret with `tls.crt`, `tls.key` and `ca.crt`;
+- client certificates: `config.mtls.clientAuthMode` `require` with the CA;
+- OAuth: `config.oauth`.
+
+Each one is switched off only explicitly, with `config.security.allowPlaintextSbi`,
+`config.mtls.clientAuthMode` `off` and `config.oauth.disabled`. A missing one stops the render with
+what to set.
+
+Without `config.nats.url` the chart deploys its own single-replica core NATS for a trial install.
+It then switches off what it lacks, explicitly, so that its defaults start and become Ready. No
+application is connected to that NATS, so every request times out: set `config.nats.url` to the
+NATS your applications use. The chart runs under the Kubernetes `restricted` Pod Security Standard.
+`values.schema.json` documents every value. The chart adds a NetworkPolicy: the SBI port is open,
+the admin port is reachable from the release's namespace and `networkPolicy.adminFrom` (add your
+Prometheus). Files the gateway reads by path — outbound TLS, a JWKS file, the OTA resolver — are
+mounted with `extraVolumes`.
+
+### Verifying a release
+
+From 0.3.0 the image and the chart are signed keylessly with [cosign](https://docs.sigstore.dev/)
+by 3eAI Labs' release workflow, which runs in the gateway's private source repository. The
+certificate names that workflow at the release tag:
+
+```bash
+v=0.3.0
+id="https://github.com/3eAI-Labs/sbi-ha-gateway-internal/.github/workflows/release.yml@refs/tags/v$v"
+cosign verify ghcr.io/3eai-labs/sbi-ha-gateway:$v \
+  --certificate-identity "$id" --certificate-oidc-issuer https://token.actions.githubusercontent.com
+cosign verify ghcr.io/3eai-labs/charts/sbi-ha-gateway:<chart version> \
+  --certificate-identity "$id" --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The image carries an SPDX SBOM and a provenance attestation
+(`docker buildx imagetools inspect ghcr.io/3eai-labs/sbi-ha-gateway:$v --format '{{ json .SBOM }}'`).
+Its `org.opencontainers.image.revision` label and its `sha-` tag name the commit of this
+repository the release was built from.
 
 ## Configuration
 
@@ -114,23 +161,29 @@ Pod Security Standard. `values.schema.json` documents every value.
 |----------|---------|---------|
 | `SBI_PORT` | `8080` | HTTP/2 port for network functions |
 | `ADMIN_PORT` | `9090` | Admin port: `/metrics`, `/health/live`, `/health/ready`, `/admin/stats` |
-| `NATS_URL` | `nats://localhost:4222` | NATS server. Credentials and TLS only through the URL (see [SECURITY.md](SECURITY.md)) |
+| `NATS_URL` | `nats://localhost:4222` | NATS server(s). `tls://` for TLS against the system roots. Keep credentials out of it: they show in the environment |
+| `NATS_CREDS_FILE`, `NATS_NKEY_SEED_FILE`, `NATS_TOKEN_FILE`, or `NATS_USER` with `NATS_PASSWORD_FILE` | empty | How the gateway authenticates to NATS: one of them; secrets are files. Two at once, or one with credentials in `NATS_URL`, stops the gateway |
+| `NATS_TLS_CA_FILE` | empty | CA of the NATS server's certificate; TLS 1.3 |
+| `NATS_TLS_CERT_FILE`, `NATS_TLS_KEY_FILE` | empty | Client certificate for NATS; TLS 1.3 |
 | `NATS_CONNECT_TIMEOUT` | `5s` | Timeout of each connection attempt; the gateway keeps retrying |
 | `NATS_REQUEST_TIMEOUT` | `2s` | Time the gateway waits for an application's reply; then 504 |
-| `TLS_CERT_FILE`, `TLS_KEY_FILE` | empty | Both set: TLS 1.3 with ALPN `h2`. Neither: cleartext HTTP/2 (h2c). One alone stops the gateway |
-| `MTLS_CLIENT_AUTH_MODE` | `off` | Client certificates on the SBI port: `off`, `optional`, `require` |
+| `TLS_CERT_FILE`, `TLS_KEY_FILE` | empty | TLS 1.3 with ALPN `h2` on the SBI port; required unless `ALLOW_PLAINTEXT_SBI`. One alone stops the gateway |
+| `ALLOW_PLAINTEXT_SBI` | `false` | `true` serves cleartext HTTP/2 (h2c, prior knowledge) without a certificate. HTTP/1.1 is refused either way |
+| `MTLS_CLIENT_AUTH_MODE` | `require` | Client certificates on the SBI port: `require` (with `MTLS_CLIENT_CA_FILE`), `optional`, `off` |
 | `MTLS_CLIENT_CA_FILE` | empty | CAs that sign network functions' certificates; required with `require` |
-| `MTLS_OUTBOUND_CERT_FILE`, `MTLS_OUTBOUND_KEY_FILE`, `MTLS_OUTBOUND_CA_FILE` | empty | Client certificate for callbacks and SMSF calls; all three or none |
-| `OAUTH_DISABLED` | `true` | `false` requires an OAuth2 access token (TS 33.501) on every SBI request |
+| `MTLS_OUTBOUND_CERT_FILE`, `MTLS_OUTBOUND_KEY_FILE`, `MTLS_OUTBOUND_CA_FILE` | empty | TLS for callbacks, SMSF calls and the NRF's JWKS. The CA alone: TLS with that trust anchor; with a certificate and its key: mTLS. Any set: `https://` only. None: `https://` against the system roots, `http://` as h2c. Always HTTP/2 |
+| `OAUTH_DISABLED` | `false` | An OAuth2 access token (TS 33.501) is required on every SBI request; `true` accepts requests without one |
 | `OAUTH_AUDIENCE` | empty | Expected `aud`: this gateway's NF instance ID. Required with OAuth on |
-| `OAUTH_NRF_JWKS_URL` | empty | JWKS endpoint of the NRF; takes precedence over `OAUTH_JWKS_FILE` |
+| `OAUTH_NRF_JWKS_URL` | empty | JWKS endpoint of the NRF; takes precedence over `OAUTH_JWKS_FILE`. Fetched with the `MTLS_OUTBOUND_*` trust anchor and certificate, 10 s at most per fetch |
 | `OAUTH_JWKS_FILE` | empty | Static JWKS file |
-| `OAUTH_JWKS_REFRESH` | `5m` | JWKS refresh interval |
+| `OAUTH_JWKS_REFRESH` | `5m` | JWKS refresh interval, at least `1s` |
 | `OAUTH_CLOCK_SKEW` | `30s` | Tolerance on `exp` and `nbf` |
 | `OAUTH_RESULT_CACHE_TTL` | `60s` | Cache of validated tokens, keyed by token and client certificate; `0` means the default |
 | `OAUTH_REQUIRE_CERT_BINDING` | `false` | `true` rejects tokens without an RFC 8705 `cnf` claim. A token that has one is always checked against the client certificate |
 | `RATE_LIMIT_RPS` | `0` | Token bucket per client (OAuth `sub`, else `User-Agent`, else address); `0` disables it |
 | `RATE_LIMIT_BURST` | `100` | Bucket size |
+| `OUTBOUND_ALLOWED_DESTINATIONS` | empty | Hosts callbacks and SMSF calls may reach: host names, `.domain` suffixes, CIDR blocks, addresses, comma-separated; checked on the address actually dialled. Empty: none. Loopback, link-local (cloud metadata), unspecified and multicast addresses only when listed by address |
+| `OUTBOUND_ALLOW_ANY` | `false` | `true` allows any destination but the always-refused addresses |
 | `OUTBOUND_PROFILE` | `sbi_direct` | `sbi_direct` POSTs notifications to the callback URI; `scef_rest` acknowledges them and leaves delivery to an external adapter |
 | `OTA_ENABLED` | `false` | Serve the SMS surfaces. Needs JetStream and the application's stream `OTA_OUTBOUND` |
 | `OTA_RESOLVER_FILE` | empty | JSON map from MSISDN to `{Supi, SmsfFqdn, SmsfPlmnId}` for the serving-SMSF lookup. Empty: every lookup answers 404 |
@@ -138,15 +191,18 @@ Pod Security Standard. `values.schema.json` documents every value.
 | `AUDIT_DISABLED` | `false` | Audit events for state-changing operations, with SUPIs masked and key material redacted |
 | `AUDIT_NATS_SUBJECT` | `audit.events` | Subject of the audit events |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. A line per request is `debug`, a 5xx `warn`; it names the route, not the URI with its SUPI |
-| `MAX_RETRIES` | `3` | Passes over a notification's callback URIs, the first included, before it is dropped |
+| `MAX_RETRIES` | `3` | Passes over a notification's callback URIs, the first included, before it is reported on `5g.data.notify.failed` |
+| `NOTIFY_WORKERS` | `32` | Notifications delivered at once; one whose network function does not answer holds one worker. Their order is not kept |
 | `RETRY_BASE_DELAY` | `1s` | Wait after the first failed pass; it doubles after each further one |
 | `SHUTDOWN_DRAIN_DELAY` | `5s` | After SIGTERM the SBI port goes on serving this long, `/health/ready` answering 503, before it closes; `0` closes at once |
+| `SHUTDOWN_TIMEOUT` | `20s` | Then the time the requests in flight, the notification deliveries and the SMS being sent have to finish. Drain delay plus this must stay below the pod's `terminationGracePeriodSeconds` |
 
 Invalid settings stop the gateway at start-up rather than weakening it or running otherwise than
-asked: OAuth on without an audience or a JWKS source, `require` without a CA file, a certificate
+asked: no TLS without `ALLOW_PLAINTEXT_SBI`, OAuth on without an audience or a JWKS source,
+`require` without a CA file, a certificate
 without its key (or the reverse), client-certificate settings without TLS, an incomplete outbound
-certificate, an unknown `OUTBOUND_PROFILE` or `LOG_LEVEL`, `MAX_RETRIES` below 1, a negative
-`SHUTDOWN_DRAIN_DELAY`.
+certificate, an unknown `OUTBOUND_PROFILE` or `LOG_LEVEL`, `MAX_RETRIES` or `NOTIFY_WORKERS` below
+1, a negative `SHUTDOWN_DRAIN_DELAY`, a `SHUTDOWN_TIMEOUT` that is not positive.
 
 The SBI port drops a connection whose request headers take over 10 s, limits each stream to 30 s of
 reading and to the NATS request timeout plus 10 s (at least 30 s) of writing, closes connections idle
@@ -156,20 +212,19 @@ for 2 minutes, and refuses request bodies over 1 MiB with 413.
 
 Prometheus metrics under `sbi_gateway_` on the admin port: requests and their durations by route
 pattern, NATS requests, OAuth validations, notification deliveries and failover position, SMS
-lookups and sends, audit events. `/health/ready` is 200 while the NATS connection is up and 503
-otherwise. Logs are JSON on standard output.
+lookups and sends, audit events, the NRF's JWKS (`oauth_jwks_keys`, `oauth_jwks_refreshes_total`,
+`oauth_jwks_last_refresh_timestamp_seconds`). `/health/ready` is 200 while the NATS connection is up and, with OAuth on,
+the gateway holds a verification key; 503 otherwise, and from SIGTERM on. Logs are JSON on standard
+output.
 
 ## Known limitations
 
-These are open in 0.2.1.
-
-- **Not all of TS 29.503 is served.** Among the operations the table above does not list: AMF and
-  SMSF registrations for non-3GPP access, the UECM custom operations (dereg-amf, pei-update,
-  roaming-info-update, send-routing-info-sm), updating an auth event
-  (`PUT …/auth-events/{authEventId}`), and the services other than UEAU, UECM, SDM, PP, EE and MT.
-  They are answered 404 or 405. Identifiers outside the formats above are refused, though TS
-  29.571's patterns admit any string.
-- **NATS has no TLS or authentication settings of its own.** See [SECURITY.md](SECURITY.md).
+- **Not all of TS 29.503 is served.**
+  - Nudm_NIDDAuthorisation, Nudm_ServiceSpecificAuthorisation and Nudm_UEIdentifier are not
+    routed: they are answered 400 `INVALID_API`.
+  - Nudr_DataRepository serves subscription data only.
+  - Identifiers outside the formats above are refused, though TS 29.571's patterns admit any string.
+- **No NRF registration.** The gateway does not register with an NRF; consumers need its address.
 
 ## Licence
 
