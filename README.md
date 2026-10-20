@@ -9,7 +9,7 @@ SMS platform.
 The gateway keeps no subscriber state. Replicas share the work through NATS queue groups and a
 JetStream work queue, so it scales horizontally.
 
-**Status: 0.3.0; 0.2.0 was the first public release.** It has not carried traffic on a production network.
+**Status: 0.4.0; 0.2.0 was the first public release.** It has not carried traffic on a production network.
 Read [Known limitations](#known-limitations) before relying on it.
 
 ## How it works
@@ -124,7 +124,12 @@ The gateway is secure by default. Its SBI port needs:
 
 Each one is switched off only explicitly, with `config.security.allowPlaintextSbi`,
 `config.mtls.clientAuthMode` `off` and `config.oauth.disabled`. A missing one stops the render with
-what to set.
+what to set. The admin port is protected too:
+- `/metrics` and `/admin/*` take a bearer token, from `config.admin.tokenSecret` or a Secret the
+  chart creates;
+- the port is served with the SBI certificate.
+
+`config.admin.auth` and `config.admin.tls` switch these off.
 
 Without `config.nats.url` the chart deploys its own single-replica core NATS for a trial install.
 It then switches off what it lacks, explicitly, so that its defaults start and become Ready. No
@@ -161,6 +166,9 @@ repository the release was built from.
 |----------|---------|---------|
 | `SBI_PORT` | `8080` | HTTP/2 port for network functions |
 | `ADMIN_PORT` | `9090` | Admin port: `/metrics`, `/health/live`, `/health/ready`, `/admin/stats` |
+| `ADMIN_TOKEN_FILE` | empty | File holding the bearer token `/metrics` and `/admin/*` require, read again every 10 s; the health endpoints stay open. Required unless `ADMIN_AUTH_DISABLED=true` |
+| `ADMIN_AUTH_DISABLED` | `false` | `true` answers `/metrics` and `/admin/*` without a token (chart `config.admin.auth: false`) |
+| `ADMIN_TLS` | `true` | Serve the admin port over TLS with the SBI port's certificate, without client certificates; `false` serves cleartext (chart `config.admin.tls`) |
 | `NATS_URL` | `nats://localhost:4222` | NATS server(s). `tls://` for TLS against the system roots. Keep credentials out of it: they show in the environment |
 | `NATS_CREDS_FILE`, `NATS_NKEY_SEED_FILE`, `NATS_TOKEN_FILE`, or `NATS_USER` with `NATS_PASSWORD_FILE` | empty | How the gateway authenticates to NATS: one of them; secrets are files. Two at once, or one with credentials in `NATS_URL`, stops the gateway |
 | `NATS_TLS_CA_FILE` | empty | CA of the NATS server's certificate; TLS 1.3 |
@@ -176,19 +184,19 @@ repository the release was built from.
 | `OAUTH_AUDIENCE` | empty | Expected `aud`: this gateway's NF instance ID. Required with OAuth on |
 | `OAUTH_NRF_JWKS_URL` | empty | JWKS endpoint of the NRF; takes precedence over `OAUTH_JWKS_FILE`. Fetched with the `MTLS_OUTBOUND_*` trust anchor and certificate, 10 s at most per fetch |
 | `OAUTH_JWKS_FILE` | empty | Static JWKS file |
-| `OAUTH_JWKS_REFRESH` | `5m` | JWKS refresh interval, at least `1s` |
+| `OAUTH_JWKS_REFRESH` | `5m` | JWKS refresh interval, at least `1s`. While the gateway holds no key, the NRF is tried every 30 s |
 | `OAUTH_CLOCK_SKEW` | `30s` | Tolerance on `exp` and `nbf` |
 | `OAUTH_RESULT_CACHE_TTL` | `60s` | Cache of validated tokens, keyed by token and client certificate; `0` means the default |
 | `OAUTH_REQUIRE_CERT_BINDING` | `false` | `true` rejects tokens without an RFC 8705 `cnf` claim. A token that has one is always checked against the client certificate |
 | `RATE_LIMIT_RPS` | `0` | Token bucket per client (OAuth `sub`, else `User-Agent`, else address); `0` disables it |
 | `RATE_LIMIT_BURST` | `100` | Bucket size |
-| `OUTBOUND_ALLOWED_DESTINATIONS` | empty | Hosts callbacks and SMSF calls may reach: host names, `.domain` suffixes, CIDR blocks, addresses, comma-separated; checked on the address actually dialled. Empty: none. Loopback, link-local (cloud metadata), unspecified and multicast addresses only when listed by address |
+| `OUTBOUND_ALLOWED_DESTINATIONS` | empty | Hosts callbacks and SMSF calls may reach: host names, `.domain` suffixes, CIDR blocks, addresses, comma-separated; checked on the address actually dialled. Empty: none. Loopback, link-local (cloud metadata), unspecified and multicast addresses only when listed by address. With name rules alone an unlisted name is refused without a DNS query; a CIDR or address rule makes every name resolved, to be checked |
 | `OUTBOUND_ALLOW_ANY` | `false` | `true` allows any destination but the always-refused addresses |
 | `OUTBOUND_PROFILE` | `sbi_direct` | `sbi_direct` POSTs notifications to the callback URI; `scef_rest` acknowledges them and leaves delivery to an external adapter |
 | `OTA_ENABLED` | `false` | Serve the SMS surfaces. Needs JetStream and the application's stream `OTA_OUTBOUND` |
 | `OTA_RESOLVER_FILE` | empty | JSON map from MSISDN to `{Supi, SmsfFqdn, SmsfPlmnId}` for the serving-SMSF lookup. Empty: every lookup answers 404 |
 | `OTA_UECM_TIMEOUT` | `3s` | Time budget of one serving-SMSF lookup |
-| `AUDIT_DISABLED` | `false` | Audit events for state-changing operations, with SUPIs masked and key material redacted |
+| `AUDIT_DISABLED` | `false` | Audit events, with SUPIs masked and no body: every state-changing operation with its outcome (`success`, `rejected`, `failed`), status, cause and request ID; OAuth refusals; the notifications and SMS sent for applications |
 | `AUDIT_NATS_SUBJECT` | `audit.events` | Subject of the audit events |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. A line per request is `debug`, a 5xx `warn`; it names the route, not the URI with its SUPI |
 | `MAX_RETRIES` | `3` | Passes over a notification's callback URIs, the first included, before it is reported on `5g.data.notify.failed` |
@@ -213,8 +221,19 @@ for 2 minutes, and refuses request bodies over 1 MiB with 413.
 Prometheus metrics under `sbi_gateway_` on the admin port: requests and their durations by route
 pattern, NATS requests, OAuth validations, notification deliveries and failover position, SMS
 lookups and sends, audit events, the NRF's JWKS (`oauth_jwks_keys`, `oauth_jwks_refreshes_total`,
-`oauth_jwks_last_refresh_timestamp_seconds`). `/health/ready` is 200 while the NATS connection is up and, with OAuth on,
-the gateway holds a verification key; 503 otherwise, and from SIGTERM on. Logs are JSON on standard
+`oauth_jwks_last_refresh_timestamp_seconds`), certificate expiry
+(`tls_certificate_expiry_timestamp_seconds`), TLS handshakes not completed
+(`tls_handshake_failures_total`) and NATS connection events (`nats_events_total`: disconnected,
+reconnected, slow_consumer). The chart can add a Prometheus Operator ServiceMonitor
+(`metrics.serviceMonitor`, with the admin token and TLS) and a PrometheusRule
+(`metrics.prometheusRule`) alerting on:
+- a pod down, no NATS connection, no OAuth verification key;
+- the 5xx and OAuth rejection ratios;
+- undelivered notifications and SMS, audit loss, a slow consumer;
+- a certificate near expiry, a protection switched off. `/health/ready` is 200 while the NATS connection is up and, with OAuth on,
+the gateway holds a verification key; 503 otherwise, and from SIGTERM on, with the reasons in its
+JSON body (`draining`, `nats_disconnected`, `oauth_no_verification_key`) and a log line when they
+change. Logs are JSON on standard
 output.
 
 ## Known limitations

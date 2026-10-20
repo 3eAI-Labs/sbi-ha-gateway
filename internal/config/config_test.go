@@ -15,7 +15,7 @@ import (
 // means the default.
 func unsetConfigEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range strings.Fields(`ADMIN_PORT AUDIT_DISABLED AUDIT_NATS_SUBJECT LOG_LEVEL MAX_RETRIES NOTIFY_WORKERS SHUTDOWN_TIMEOUT
+	for _, k := range strings.Fields(`ADMIN_PORT AUDIT_DISABLED AUDIT_NATS_SUBJECT LOG_LEVEL MAX_RETRIES NOTIFY_WORKERS SHUTDOWN_TIMEOUT ADMIN_TOKEN_FILE ADMIN_TLS ADMIN_AUTH_DISABLED
 		MTLS_CLIENT_AUTH_MODE MTLS_CLIENT_CA_FILE MTLS_OUTBOUND_CA_FILE MTLS_OUTBOUND_CERT_FILE
 		MTLS_OUTBOUND_KEY_FILE NATS_CONNECT_TIMEOUT NATS_REQUEST_TIMEOUT NATS_URL NATS_CREDS_FILE
 		NATS_NKEY_SEED_FILE NATS_USER NATS_PASSWORD_FILE NATS_TOKEN_FILE NATS_TLS_CA_FILE
@@ -43,6 +43,8 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 3, cfg.MaxRetries)
 	assert.Equal(t, 32, cfg.NotifyWorkers)
 	assert.Equal(t, 20*time.Second, cfg.ShutdownTimeout)
+	assert.True(t, cfg.AdminTLS)
+	assert.False(t, cfg.AdminAuthDisabled)
 	assert.Equal(t, 1*time.Second, cfg.RetryBaseDelay)
 	assert.Equal(t, 5*time.Second, cfg.ShutdownDrainDelay)
 	// Secure by default.

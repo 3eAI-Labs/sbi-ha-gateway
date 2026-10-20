@@ -75,6 +75,19 @@ config:
   server:
     sbiPort: "8080"
     adminPort: "9090"
+
+  # The admin port: /metrics, /health/live, /health/ready, /admin/stats. Protected by default,
+  # like the SBI port; the health endpoints stay open for the kubelet.
+  # - auth: /metrics and /admin/* require the bearer token in tokenSecret's tokenKey. Without a
+  #   tokenSecret the chart creates <fullname>-admin-token with a random token; the
+  #   ServiceMonitor (metrics.serviceMonitor) uses it. false is an explicit opt-out.
+  # - tls: the port is served with tls.existingSecret's certificate; the probes use HTTPS.
+  #   false is an explicit opt-out; a trial install without TLS switches it off itself.
+  admin:
+    auth: true
+    tokenSecret: ""
+    tokenKey: "token"
+    tls: true
   logLevel: info            # debug | info | warn | error
 
   nats:
@@ -209,3 +222,17 @@ nats:
     limits:
       cpu: 500m
       memory: 256Mi
+
+# Prometheus Operator resources; their CRDs must be installed. Prometheus must reach the admin
+# port: add its namespace to networkPolicy.adminFrom.
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}      # e.g. release: kube-prometheus-stack, for the operator's selector
+    tlsConfig: {}   # with admin TLS (the default): e.g. {insecureSkipVerify: true}, or the SBI CA
+  prometheusRule:
+    enabled: false
+    labels: {}
+    errorRatio: 0.05            # share of 5xx SBI answers that alerts
+    certificateExpiryDays: 14   # alert this long before a certificate expires

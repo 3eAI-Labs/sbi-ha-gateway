@@ -8,6 +8,90 @@ Versions up to 1.0.0 were released privately. 0.2.0 is the first public release:
 goes down on purpose, because the gateway stays below 1.0 until it has carried traffic on a
 production network. Its entry describes what changed for an installation of 1.0.0.
 
+## [0.4.0] — 2026-10-20
+
+The admin port's protection, and the hardening 0.3.0's end-to-end run asked for. Breaking for
+installations: the admin port needs its token and TLS. The chart provides both, or each is switched
+off explicitly. Audit consumers get refused and failed operations too, with an `outcome`. The NATS
+contract is unchanged (`sbi-ha-gateway-client` v0.3.0). Chart 0.4.0 deploys 0.4.0; its new values
+are `config.admin` and `metrics`.
+
+### Changed — breaking
+
+- **The admin port is protected by default, like the SBI port.** 0.3.0 served `/metrics` and
+  `/admin/stats` to anyone who reached the port, in cleartext. The health endpoints stay open for
+  the kubelet.
+  - **Token:** `/metrics` and `/admin/*` require a bearer token from `ADMIN_TOKEN_FILE`, re-read
+    every 10 s so that a rotated Secret takes effect without a restart. Without one the gateway
+    stops at start-up, unless `ADMIN_AUTH_DISABLED=true`.
+  - **TLS:** the port is served over TLS with the SBI certificate (`ADMIN_TLS`, default `true`).
+    Without a certificate the gateway stops, unless `ADMIN_TLS=false`.
+  - **Chart:** `config.admin.auth` and `config.admin.tls` default to `true`. Without
+    `config.admin.tokenSecret` the chart creates `<fullname>-admin-token` with a random token,
+    kept across upgrades, and `metrics.serviceMonitor` uses it. The probes use HTTPS. A trial
+    install without TLS switches admin TLS off itself; any other install without
+    `tls.existingSecret` stops at render unless `config.admin.tls=false`.
+  - **Migration:** give Prometheus the token (the chart's ServiceMonitor does) and HTTPS, or switch
+    each protection off explicitly. Each one off is a WARN at start-up and a 0 in
+    `sbi_gateway_security_protection` (`admin_auth`, `admin_tls`).
+
+### Changed
+
+- **Refused and failed operations are audited.** 0.3.0 audited a state-changing operation only
+  when it succeeded: one an application refused, that timed out or that the gateway turned away
+  left no trace.
+  - Every audit event now has `outcome` (`success`, `rejected`, `failed`), `status`, `cause` (the
+    ProblemDetails cause) and `request_id`, so a consumer that counted events as changes must read
+    `outcome`.
+  - OAuth refusals are audited (`AccessToken`, user the client certificate's NF instance ID).
+  - The notifications and MT SMS the gateway sends for applications are audited too
+    (`DeliverNotification`, `MtForwardSm`, user `nats`, `target` the network function).
+  - The fields are additions; events still carry no body.
+
+### Added
+
+- **Metrics:**
+  - `tls_certificate_expiry_timestamp_seconds{certificate="sbi"|"outbound"}` and
+    `tls_handshake_failures_total{port}`. Handshake errors, one per scanner connection, are now
+    logged at debug, where 0.3.0 wrote them at info.
+  - `nats_events_total{event}`: disconnected, reconnected, `slow_consumer`. A subscription that
+    fell behind lost messages unseen: nats.go had no error handler.
+  - `callback_retries_total` counts the attempts after a failed one; 0.3.0 defined it but never
+    incremented it.
+- **Chart: Prometheus Operator resources, opt-in.**
+  - `metrics.serviceMonitor` scrapes `/metrics` with the admin token and TLS when they are set.
+  - `metrics.prometheusRule` alerts on: a pod down, no NATS connection, no verification key,
+    the 5xx and OAuth rejection ratios, undelivered notifications and SMS, audit loss, a slow
+    consumer, a certificate near expiry and a protection switched off. The rules are checked and
+    unit-tested with promtool.
+- **`/health/ready` says why it is 503:** a JSON body with the reasons (`draining`,
+  `nats_disconnected`, `oauth_no_verification_key`), and a log line when readiness changes.
+
+### Fixed
+
+- **A NATS outage no longer writes an error line per request.** 0.3.0 logged "NATS request
+  failed" at error level for every SBI request it could not pass on, without the request ID or
+  the subject. The line is now written once every 10 s at most, with how many failures went
+  unreported, the request ID and the subject; each failure is logged at debug and counted in
+  `sbi_gateway_nats_requests_total`.
+- **A gateway started while the NRF was down becomes ready within 30 s of the NRF answering.**
+  The JWKS cache scheduled the fetch after a failed one at the full `OAUTH_JWKS_REFRESH` (5 m by
+  default), so 0.3.0 stayed unready, rejecting every token, for up to that long. While it holds
+  no verification key, the gateway now retries the NRF every 30 s.
+
+### Security
+
+- **Audit events reach NATS at shutdown and are not lost silently.** 0.3.0 wrote the events
+  still queued at shutdown to the log with two fields, and a publish NATS refused was neither
+  counted nor logged in full. The queue is now published before the connection closes. A refusal
+  is counted (`sbi_gateway_audit_publish_failures_total`) and logged with every field.
+- **An unlisted host name is no longer resolved.** When `OUTBOUND_ALLOWED_DESTINATIONS` has name
+  rules alone, a name none matches is refused before any DNS query. 0.3.0 resolved it first, so an
+  application able to publish a notification or an SMS could make the gateway query DNS for any
+  name. It also retried such a URI in every pass as a transport error, where it is now dropped as
+  not allowed. With a CIDR or address rule, or `OUTBOUND_ALLOW_ANY`, names are still resolved:
+  the decision is on the address.
+
 ## [0.3.0] — 2026-10-19
 
 Conformance to the 3GPP specifications and a secure default. Breaking for applications and for

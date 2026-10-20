@@ -184,7 +184,20 @@ func (h *SBIHandler) serve(op *specOperation, at []int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		routectx.Set(r, route)
 
-		params, ueID, ok := h.params(w, r, op, at)
+		// A state-changing operation is audited however it ends — refused by the gateway or
+		// the application, failed, or done — with the operation and the (masked) subscriber,
+		// never the body: the gateway does not interpret bodies, so it cannot tell key
+		// material from the rest (Nudr authentication-subscription carries encPermanentKey,
+		// and in a JSON Patch the secret sits under "value").
+		var ueID string
+		if op.Method != http.MethodGet {
+			rec := audit.NewRecorder(w)
+			w = rec
+			defer func() { audit.Request(r, op.OperationID, op.API, ueID, rec.Status(), rec.Cause()) }()
+		}
+
+		params, id, ok := h.params(w, r, op, at)
+		ueID = id
 		if !ok {
 			return
 		}
@@ -228,14 +241,6 @@ func (h *SBIHandler) serve(op *specOperation, at []int) http.HandlerFunc {
 				}
 				w.Header().Set("Location", ResourceURI(r, "/"+url.PathEscape(id)))
 			}
-		}
-
-		// The audit event names the operation and the (masked) subscriber, never the body:
-		// the gateway does not interpret bodies, so it cannot tell key material from the
-		// rest — Nudr authentication-subscription carries encPermanentKey, and in a JSON
-		// Patch the secret sits under "value".
-		if op.Method != http.MethodGet {
-			audit.Log(r, op.OperationID, op.API, ueID, nil)
 		}
 
 		if status == http.StatusNoContent {

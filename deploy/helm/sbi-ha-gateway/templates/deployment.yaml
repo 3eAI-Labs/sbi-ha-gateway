@@ -40,6 +40,9 @@ spec:
       */}}
       {{- $trial := include "sbi-ha-gateway.natsBundled" . }}
       {{- $plaintext := not .Values.tls.existingSecret }}
+      {{- if and .Values.config.admin.tls $plaintext (not $trial) }}
+      {{- fail "config.nats.url is set, so this is not a trial install: the admin port is served with the SBI certificate (tls.existingSecret), or config.admin.tls=false" }}
+      {{- end }}
       {{- if and $plaintext (not $trial) (not .Values.config.security.allowPlaintextSbi) }}
       {{- fail "config.nats.url is set, so this is not a trial install: the SBI port needs TLS (tls.existingSecret), or config.security.allowPlaintextSbi=true" }}
       {{- end }}
@@ -74,6 +77,15 @@ spec:
               value: {{ .Values.config.server.sbiPort | quote }}
             - name: ADMIN_PORT
               value: {{ .Values.config.server.adminPort | quote }}
+            {{- if .Values.config.admin.auth }}
+            - name: ADMIN_TOKEN_FILE
+              value: {{ printf "/etc/sbi-gateway/admin/%s" .Values.config.admin.tokenKey | quote }}
+            {{- else }}
+            - name: ADMIN_AUTH_DISABLED
+              value: "true"
+            {{- end }}
+            - name: ADMIN_TLS
+              value: {{ include "sbi-ha-gateway.adminTLS" . | eq "true" | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.config.logLevel | quote }}
             # NATS: config.nats.url, or the bundled NATS when it is empty
@@ -177,17 +189,19 @@ spec:
             httpGet:
               path: /health/live
               port: admin
+              scheme: {{ ternary "HTTPS" "HTTP" (include "sbi-ha-gateway.adminTLS" . | eq "true") }}
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /health/ready
               port: admin
+              scheme: {{ ternary "HTTPS" "HTTP" (include "sbi-ha-gateway.adminTLS" . | eq "true") }}
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.extraVolumeMounts }}
+          {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.config.admin.auth .Values.extraVolumeMounts }}
           volumeMounts:
             {{- if .Values.tls.existingSecret }}
             - name: tls
@@ -199,11 +213,16 @@ spec:
               mountPath: /etc/sbi-gateway/nats
               readOnly: true
             {{- end }}
+            {{- if .Values.config.admin.auth }}
+            - name: admin-token
+              mountPath: /etc/sbi-gateway/admin
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
-      {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.extraVolumes }}
+      {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.config.admin.auth .Values.extraVolumes }}
       volumes:
         {{- if .Values.tls.existingSecret }}
         - name: tls
@@ -215,6 +234,12 @@ spec:
         - name: nats-secret
           secret:
             secretName: {{ .Values.config.nats.secret.name }}
+            defaultMode: 0440
+        {{- end }}
+        {{- if .Values.config.admin.auth }}
+        - name: admin-token
+          secret:
+            secretName: {{ include "sbi-ha-gateway.adminTokenSecret" . }}
             defaultMode: 0440
         {{- end }}
         {{- with .Values.extraVolumes }}

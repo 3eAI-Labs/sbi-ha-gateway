@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/audit"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/authctx"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/models"
@@ -139,6 +140,11 @@ func reasonDetail(r oauth.FailReason) string {
 // is the scope needed, with insufficient_scope.
 func writeOAuthFail(w http.ResponseWriter, r *http.Request, status int, errCode, scope string, reason oauth.FailReason, detail string) {
 	metrics.RecordOAuthValidation("fail", string(reason))
+	var peer string
+	if id := PeerIdentityFromContext(r.Context()); id != nil {
+		peer = id.NFInstanceID
+	}
+	audit.Refused(r, peer, oauth.RequiredScope(r.URL.Path), status, string(reason))
 
 	params := []string{"realm=" + quoted(apiURI(r))}
 	if errCode != "" {

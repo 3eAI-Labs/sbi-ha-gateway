@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -102,11 +103,18 @@ func TestHandlers_RealNATS(t *testing.T) {
 
 	var audited atomic.Int64
 	var leaked atomic.Int64 // audit events carrying a request body's secret
+	var eventsMu sync.Mutex
+	var events []cgaudit.Event
 	_, err = nc.Subscribe("audit.test", func(m *gnats.Msg) {
 		audited.Add(1)
 		if strings.Contains(string(m.Data), "SECRET") {
 			leaked.Add(1)
 		}
+		var ev cgaudit.Event
+		_ = json.Unmarshal(m.Data, &ev)
+		eventsMu.Lock()
+		events = append(events, ev)
+		eventsMu.Unlock()
 	})
 	require.NoError(t, err)
 	cgaudit.SetPublisher(nc, "audit.test")
@@ -132,11 +140,27 @@ func TestHandlers_RealNATS(t *testing.T) {
 		r.ServeHTTP(rec, req)
 		return rec
 	}
-	// noAudit checks that a phase emitted no audit event. Events go out through a queue;
-	// give a wrongly emitted one time to arrive.
-	noAudit := func(t *testing.T, before int64) {
-		time.Sleep(300 * time.Millisecond)
-		assert.Equal(t, before, audited.Load(), "audit events")
+	// auditedAs checks that a phase audited each state-changing call, and only those, with
+	// the outcome, status and cause the network function got: refused and failed attempts
+	// leave a trace too.
+	var wantAudited int64
+	for _, c := range itCalls {
+		if c.audited {
+			wantAudited++
+		}
+	}
+	auditedAs := func(t *testing.T, before int64, outcome string, status int, cause string) {
+		t.Helper()
+		require.Eventually(t, func() bool { return audited.Load() == before+wantAudited }, 5*time.Second, 20*time.Millisecond)
+		time.Sleep(100 * time.Millisecond) // none more
+		require.Equal(t, before+wantAudited, audited.Load(), "audit events")
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
+		for _, ev := range events[before:] {
+			assert.Equal(t, outcome, ev.Outcome, "%s", ev.Action)
+			assert.Equal(t, status, ev.Status, "%s", ev.Action)
+			assert.Equal(t, cause, ev.Cause, "%s", ev.Action)
+		}
 	}
 
 	t.Run("results", func(t *testing.T) {
@@ -151,15 +175,18 @@ func TestHandlers_RealNATS(t *testing.T) {
 		})
 		require.NoError(t, err)
 		defer func() { require.NoError(t, app.Unsubscribe()) }()
-		var want int64
+		before := audited.Load()
 		for _, c := range itCalls {
 			rec := serve(c.method, c.path, c.contentType, c.body)
 			assert.Less(t, rec.Code, 300, "%s %s: %s", c.method, c.path, rec.Body.String())
-			if c.audited {
-				want++
-			}
 		}
-		require.Eventually(t, func() bool { return audited.Load() == want }, 5*time.Second, 20*time.Millisecond)
+		require.Eventually(t, func() bool { return audited.Load() == before+wantAudited }, 5*time.Second, 20*time.Millisecond)
+		eventsMu.Lock()
+		for _, ev := range events[before:] {
+			assert.Equal(t, "success", ev.Outcome, "%s", ev.Action)
+			assert.Less(t, ev.Status, 300, "%s", ev.Action)
+		}
+		eventsMu.Unlock()
 		assert.Zero(t, leaked.Load(), "audit events with key material")
 	})
 
@@ -175,7 +202,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 			assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"), "%s %s", c.method, c.path)
 			assert.JSONEq(t, problem, rec.Body.String(), "%s %s", c.method, c.path)
 		}
-		noAudit(t, before)
+		auditedAs(t, before, "rejected", http.StatusNotFound, "USER_NOT_FOUND")
 	})
 
 	t.Run("silent application", func(t *testing.T) {
@@ -191,7 +218,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 			assert.GreaterOrEqual(t, elapsed, itTimeout, "%s %s", c.method, c.path)
 			assert.Less(t, elapsed, 5*itTimeout, "%s %s", c.method, c.path)
 		}
-		noAudit(t, before)
+		auditedAs(t, before, "failed", http.StatusGatewayTimeout, "TARGET_NF_NOT_REACHABLE")
 	})
 
 	t.Run("no application", func(t *testing.T) {
@@ -202,7 +229,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 			assertProblem(t, rec, http.StatusGatewayTimeout, "TARGET_NF_NOT_REACHABLE", c.method+" "+c.path)
 			assert.Less(t, time.Since(start), itTimeout, "%s %s: no responders is known at once", c.method, c.path)
 		}
-		noAudit(t, before)
+		auditedAs(t, before, "failed", http.StatusGatewayTimeout, "TARGET_NF_NOT_REACHABLE")
 	})
 
 	t.Run("stream captures 5g.>", func(t *testing.T) {
@@ -216,7 +243,7 @@ func TestHandlers_RealNATS(t *testing.T) {
 			assertProblem(t, rec, http.StatusInternalServerError, "SYSTEM_FAILURE", c.method+" "+c.path)
 			assert.False(t, strings.Contains(rec.Body.String(), "CORE_EVENTS"), "stream name in the problem detail")
 		}
-		noAudit(t, before)
+		auditedAs(t, before, "failed", http.StatusInternalServerError, "SYSTEM_FAILURE")
 	})
 }
 

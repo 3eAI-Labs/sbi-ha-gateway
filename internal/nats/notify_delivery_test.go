@@ -16,8 +16,12 @@ import (
 
 	sbiclient "github.com/3eAI-Labs/sbi-ha-gateway-client"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/outbound"
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
+	cgaudit "github.com/3eAI-Labs/sbi-ha-gateway/internal/platform/audit"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/sbi"
 	gnats "github.com/nats-io/nats.go"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -205,6 +209,9 @@ func TestSubscriber_ReportsUndeliveredNotification(t *testing.T) {
 	}}
 	conn, sub, failures := startSubscriber(t, fake, 2)
 	defer func() { _ = sub.Stop(context.Background()) }()
+	audited := &auditCapture{}
+	cgaudit.SetPublisher(audited, "audit.test")
+	defer cgaudit.SetPublisher(nil, "")
 
 	notify(t, conn, "http://amf/cb", "http://amf2/cb")
 	select {
@@ -220,6 +227,11 @@ func TestSubscriber_ReportsUndeliveredNotification(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no NotificationFailure published")
 	}
+	// The gateway's action for the application is audited too (C.7).
+	require.Eventually(t, func() bool { return len(audited.snapshot()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	ev := audited.snapshot()[0]
+	assert.Equal(t, cgaudit.Event{UserID: "nats", Action: "DeliverNotification", Resource: "notification",
+		Outcome: "rejected", Cause: "HTTP_404", Target: "http://amf", Timestamp: ev.Timestamp}, ev)
 }
 
 // Stop waits for the deliveries in flight; one still running at the deadline is cancelled and
@@ -279,4 +291,78 @@ func TestDeliverWithFailover_LogsNoCallbackURI(t *testing.T) {
 	if strings.Contains(logs.String(), "imsi-") || !strings.Contains(logs.String(), "http://127.0.0.1:1") {
 		t.Errorf("log:\n%s", logs.String())
 	}
+}
+
+type auditCapture struct {
+	mu     sync.Mutex
+	events []cgaudit.Event
+}
+
+func (c *auditCapture) Publish(_ string, data []byte) error {
+	var ev cgaudit.Event
+	_ = json.Unmarshal(data, &ev)
+	c.mu.Lock()
+	c.events = append(c.events, ev)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *auditCapture) snapshot() []cgaudit.Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]cgaudit.Event(nil), c.events...)
+}
+
+func counterOf(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	return m.GetCounter().GetValue()
+}
+
+// callback_retries_total counts each attempt after a failed one, by what failed last (C.8:
+// 0.3.0 defined it and never incremented it).
+func TestDeliverWithFailover_CountsRetries(t *testing.T) {
+	calls := 0
+	fake := &fakeOutbound{respond: func(string) (*outbound.Response, error) {
+		calls++
+		switch calls {
+		case 1:
+			return unavailable(0)
+		case 2:
+			return nil, errors.New("connection refused")
+		}
+		return &outbound.Response{StatusCode: 204}, nil
+	}}
+	s := NewSubscriberWithOutbound(nil, newQuietLogger(), fake, time.Second).WithRetry(3, time.Millisecond)
+	fiveXX := counterOf(t, metrics.CallbackRetries.WithLabelValues("5xx"))
+	transport := counterOf(t, metrics.CallbackRetries.WithLabelValues("transport"))
+
+	assert.Equal(t, "failover", s.deliverWithFailover(context.Background(), []string{"http://nf"}, nil).result)
+	assert.Equal(t, fiveXX+1, counterOf(t, metrics.CallbackRetries.WithLabelValues("5xx")))
+	assert.Equal(t, transport+1, counterOf(t, metrics.CallbackRetries.WithLabelValues("transport")))
+}
+
+// A subscription that falls behind loses messages: counted and logged, where nats.go without an
+// error handler dropped them unsaid (C.8).
+func TestClient_SlowConsumerCounted(t *testing.T) {
+	srv := runQuickServer()
+	defer srv.Shutdown()
+	c, err := NewClientWithSecurity(srv.ClientURL(), newQuietLogger(), time.Second, Security{})
+	require.NoError(t, err)
+	defer c.Close()
+	before := counterOf(t, metrics.NatsEvents.WithLabelValues("slow_consumer"))
+
+	block := make(chan struct{})
+	defer close(block)
+	sub, err := c.GetConn().Subscribe("slow", func(*gnats.Msg) { <-block })
+	require.NoError(t, err)
+	require.NoError(t, sub.SetPendingLimits(1, -1))
+	for range 20 {
+		require.NoError(t, c.GetConn().Publish("slow", []byte("x")))
+	}
+	require.NoError(t, c.GetConn().Flush())
+	require.Eventually(t, func() bool {
+		return counterOf(t, metrics.NatsEvents.WithLabelValues("slow_consumer")) > before
+	}, 3*time.Second, 20*time.Millisecond)
 }

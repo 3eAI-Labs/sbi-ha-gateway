@@ -163,6 +163,25 @@
             "adminPort": { "type": "string", "pattern": "^[0-9]{1,5}$" }
           }
         },
+        "admin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "auth": {
+              "type": "boolean",
+              "description": "/metrics and /admin/* require a bearer token. false is an explicit opt-out (a WARN and sbi_gateway_security_protection{protection=\"admin_auth\"} 0 say so)."
+            },
+            "tokenSecret": {
+              "type": "string",
+              "description": "Secret holding the bearer token. Empty: the chart creates <fullname>-admin-token with a random token."
+            },
+            "tokenKey": { "type": "string", "minLength": 1, "description": "Key of the token in tokenSecret." },
+            "tls": {
+              "type": "boolean",
+              "description": "Serve the admin port with tls.existingSecret's certificate; the probes use HTTPS. false is an explicit opt-out; a trial install without TLS switches it off itself."
+            }
+          }
+        },
         "logLevel": {
           "type": "string",
           "enum": ["debug", "info", "warn", "error"],
@@ -432,6 +451,32 @@
           }
         }
       }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Render a Prometheus Operator ServiceMonitor for the admin port's /metrics (admin token and TLS included)." },
+            "interval": { "type": "string", "pattern": "^[1-9][0-9]*(s|m)$" },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+            "tlsConfig": { "type": "object", "description": "The ServiceMonitor endpoint's tlsConfig, with config.admin.tls." }
+          }
+        },
+        "prometheusRule": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Render a PrometheusRule with the gateway's alerts; they select the series the chart's ServiceMonitor scrapes." },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+            "errorRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+            "certificateExpiryDays": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
     }
-  }
+}
 }

@@ -18,6 +18,13 @@ type Config struct {
 	// Server Configuration
 	SBIPort   string
 	AdminPort string
+	// AdminTokenFile holds the bearer token /metrics and /admin/* require, unless
+	// AdminAuthDisabled.
+	AdminTokenFile    string
+	AdminAuthDisabled bool
+	// AdminTLS serves the admin port over TLS with the SBI port's certificate; false is an
+	// explicit choice.
+	AdminTLS bool
 
 	// TLS Configuration. When both fields are set the server uses TLS 1.3;
 	// otherwise it falls back to h2c (cleartext HTTP/2) for internal mesh use.
@@ -129,8 +136,11 @@ func Load() (*Config, error) {
 	var l loader
 	cfg := &Config{
 		// Server
-		SBIPort:   l.str("SBI_PORT", "8080"),
-		AdminPort: l.str("ADMIN_PORT", "9090"),
+		SBIPort:           l.str("SBI_PORT", "8080"),
+		AdminPort:         l.str("ADMIN_PORT", "9090"),
+		AdminTokenFile:    l.str("ADMIN_TOKEN_FILE", ""),
+		AdminAuthDisabled: l.boolean("ADMIN_AUTH_DISABLED", false),
+		AdminTLS:          l.boolean("ADMIN_TLS", true),
 
 		// TLS (empty defaults → h2c)
 		TLSCertFile: l.str("TLS_CERT_FILE", ""),

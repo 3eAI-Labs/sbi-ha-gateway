@@ -4,9 +4,13 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -222,4 +226,48 @@ func TestLog_BackwardsCompatibleAPI(t *testing.T) {
 	resetAuditState(t)
 	Log(context.Background(), "user", "ACTION", "resource", "rid", "any payload")
 	// No assertion — passing if no panic + no compilation error.
+}
+
+// slowPublisher holds each Publish for a while, so that events are still queued at stop.
+type slowPublisher struct{ fakePublisher }
+
+func (p *slowPublisher) Publish(subject string, data []byte) error {
+	time.Sleep(20 * time.Millisecond)
+	return p.fakePublisher.Publish(subject, data)
+}
+
+// At stop the worker publishes what is still queued, and SetPublisher(nil) returns after it:
+// the connection is closed next. Before, the queue went to the log with two fields.
+func TestSetPublisherNil_PublishesTheQueue(t *testing.T) {
+	resetAuditState(t)
+	pub := &slowPublisher{}
+	SetPublisher(pub, "")
+	for i := range 10 {
+		Emit(context.Background(), Event{UserID: "u", Action: fmt.Sprint(i)})
+	}
+	SetPublisher(nil, "")
+	if n := len(pub.snapshot()); n != 10 {
+		t.Errorf("%d of 10 published before SetPublisher(nil) returned", n)
+	}
+}
+
+// A refused publish is counted, and the event is logged with every field.
+func TestPublishFailure_CountedAndLoggedWhole(t *testing.T) {
+	resetAuditState(t)
+	var logs bytes.Buffer
+	saved := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(saved) })
+	before := PublishFailures()
+	SetPublisher(&fakePublisher{err: errors.New("nats: connection closed")}, "")
+	Emit(context.Background(), Event{UserID: "amf-1", Action: "3GppRegistration", Outcome: "rejected", Status: 404, Cause: "USER_NOT_FOUND", RequestID: "req-9"})
+	SetPublisher(nil, "")
+	if got := PublishFailures() - before; got != 1 {
+		t.Errorf("%d publish failures counted, want 1", got)
+	}
+	for _, field := range []string{`"outcome":"rejected"`, `"status":404`, `"cause":"USER_NOT_FOUND"`, `"request_id":"req-9"`} {
+		if !strings.Contains(logs.String(), field) {
+			t.Errorf("log lacks %s:\n%s", field, logs.String())
+		}
+	}
 }

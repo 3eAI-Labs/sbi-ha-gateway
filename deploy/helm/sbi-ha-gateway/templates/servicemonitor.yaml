@@ -1,0 +1,33 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+# Prometheus Operator scrape of the admin port's /metrics: the admin token and TLS when the
+# gateway has them. Prometheus must be let in by networkPolicy.adminFrom.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}
+  labels:
+    {{- include "sbi-ha-gateway.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "sbi-ha-gateway.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scheme: {{ ternary "https" "http" (include "sbi-ha-gateway.adminTLS" . | eq "true") }}
+      {{- with .Values.metrics.serviceMonitor.tlsConfig }}
+      tlsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.config.admin.auth }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ include "sbi-ha-gateway.adminTokenSecret" . }}
+          key: {{ .Values.config.admin.tokenKey }}
+      {{- end }}
+{{- end }}

@@ -6,6 +6,7 @@ package sbi
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
@@ -96,6 +97,43 @@ func TestDestinations_Dial(t *testing.T) {
 		}
 		if !c.allowed && (!errors.Is(err, ErrDestinationNotAllowed) || s.callbacked.Load()) {
 			t.Errorf("%q allow-any %v, %s: %v, reached %v; want ErrDestinationNotAllowed", c.list, c.allowAny, c.url, err, s.callbacked.Load())
+		}
+	}
+}
+
+// A name nothing could allow is refused unresolved: with name rules alone, a URI cannot make
+// the gateway query DNS for an unlisted name (0.3.0's kind run: "other.example" was looked up
+// on every pass). With a CIDR rule, or allow-any, the name is resolved to be decided on.
+func TestDestinations_NoLookupForUnlistedName(t *testing.T) {
+	for _, c := range []struct {
+		list     string
+		allowAny bool
+		resolved bool
+	}{
+		{".apps.svc.cluster.local, smsf.example", false, false},
+		{".apps.svc.cluster.local, 10.0.0.0/8", false, true},
+		{"", true, true},
+	} {
+		d, err := ParseDestinations(c.list, c.allowAny)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var looked []string
+		d.lookup = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			looked = append(looked, host)
+			return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+		}
+		dialled := false
+		dial := d.DialContext(func(context.Context, string, string) (net.Conn, error) {
+			dialled = true
+			return nil, errors.New("not dialled in this test")
+		})
+		_, err = dial(context.Background(), "tcp", "other.example:80")
+		if resolved := len(looked) > 0; resolved != c.resolved {
+			t.Errorf("%q allow-any %v: resolved %v, want %v", c.list, c.allowAny, resolved, c.resolved)
+		}
+		if !c.resolved && (!errors.Is(err, ErrDestinationNotAllowed) || dialled) {
+			t.Errorf("%q: %v, dialled %v; want ErrDestinationNotAllowed without a dial", c.list, err, dialled)
 		}
 	}
 }

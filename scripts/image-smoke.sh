@@ -41,6 +41,7 @@ docker run -d --name "$NATS" "$NATS_IMAGE" >/dev/null
 # opt-out explicit.
 docker run -d --name "$GW" --network "container:$NATS" \
   -e ALLOW_PLAINTEXT_SBI=true -e MTLS_CLIENT_AUTH_MODE=off -e OAUTH_DISABLED=true \
+  -e ADMIN_TLS=false -e ADMIN_AUTH_DISABLED=true \
   "$IMAGE" >/dev/null
 
 code=000

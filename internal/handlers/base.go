@@ -19,7 +19,9 @@ import (
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/models"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/nats"
+	"github.com/go-chi/chi/v5/middleware"
 	gnats "github.com/nats-io/nats.go"
+	"sync"
 )
 
 // UE identifier formats of TS 29.571 (Supi, Suci, Gpsi, ExtGroupId). The specification's
@@ -76,6 +78,33 @@ func (k UeIDKinds) String() string {
 type BaseHandler struct {
 	Log            *slog.Logger
 	RequestTimeout time.Duration
+
+	failures failureLog
+}
+
+// failureLogInterval is how often a failed NATS request is logged at error level at most.
+const failureLogInterval = 10 * time.Second
+
+// failureLog reports failed NATS requests at most once per failureLogInterval, with how many
+// went unreported since: in an outage every request fails, and a line each would bury the log.
+// Each failure is counted in nats_requests_total and logged at debug.
+type failureLog struct {
+	mu         sync.Mutex
+	next       time.Time
+	unreported int
+}
+
+// report says whether to log a failure at now, and how many were not since the last one.
+func (f *failureLog) report(now time.Time) (log bool, unreported int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if now.Before(f.next) {
+		f.unreported++
+		return false, 0
+	}
+	f.next = now.Add(failureLogInterval)
+	unreported, f.unreported = f.unreported, 0
+	return true, unreported
 }
 
 // DefaultRequestTimeout is used when no timeout is configured
@@ -132,7 +161,7 @@ func (h *BaseHandler) Exchange(w http.ResponseWriter, r *http.Request, nc nats.I
 	}
 	reply, err := nc.Request(r.Context(), subject, data, h.RequestTimeout)
 	if err != nil {
-		h.WriteRequestFailure(w, err)
+		h.WriteRequestFailure(w, r, subject, err)
 		return false
 	}
 	return h.DecodeReply(w, reply, v)
@@ -143,9 +172,18 @@ func (h *BaseHandler) Exchange(w http.ResponseWriter, r *http.Request, nc nats.I
 // subject: the back end is misconfigured and waiting would not help, so it is 500. No
 // reply in time, no application subscribed or no NATS connection is 504: the network
 // function may try another producer.
-func (h *BaseHandler) WriteRequestFailure(w http.ResponseWriter, err error) {
+func (h *BaseHandler) WriteRequestFailure(w http.ResponseWriter, r *http.Request, subject string, err error) {
 	if h.Log != nil {
-		h.Log.Error("NATS request failed", slog.Any("error", err))
+		attrs := []any{
+			slog.String("subject", subject),
+			slog.String("request_id", middleware.GetReqID(r.Context())),
+			slog.Any("error", err),
+		}
+		if log, unreported := h.failures.report(time.Now()); log {
+			h.Log.Error("NATS request failed", append(attrs, slog.Int("unreported_since_last", unreported))...)
+		} else {
+			h.Log.Debug("NATS request failed", attrs...)
+		}
 	}
 	switch {
 	case errors.Is(err, nats.ErrJetStreamReply):

@@ -65,6 +65,7 @@ func NewClientWithSecurity(url string, log *slog.Logger, connectTimeout time.Dur
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			log.Warn("NATS disconnected", slog.Any("error", err))
 			metrics.SetNatsConnected(false)
+			metrics.RecordNatsEvent("disconnected")
 		}),
 		// The first connection, also when it is made only after retrying
 		// (RetryOnFailedConnect); later ones go to the ReconnectHandler.
@@ -74,6 +75,22 @@ func NewClientWithSecurity(url string, log *slog.Logger, connectTimeout time.Dur
 		nats.ReconnectHandler(func(_ *nats.Conn) {
 			log.Info("NATS reconnected")
 			metrics.SetNatsConnected(true)
+			metrics.RecordNatsEvent("reconnected")
+		}),
+		// Asynchronous errors, a slow consumer above all: a subscription that fell behind
+		// loses the messages NATS could not buffer. Without a handler nats.go drops them unsaid.
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			var subject string
+			if sub != nil {
+				subject = sub.Subject
+			}
+			if errors.Is(err, nats.ErrSlowConsumer) {
+				metrics.RecordNatsEvent("slow_consumer")
+				log.Warn("NATS slow consumer: messages dropped", slog.String("subject", subject))
+				return
+			}
+			metrics.RecordNatsEvent("error")
+			log.Warn("NATS error", slog.String("subject", subject), slog.Any("error", err))
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			metrics.SetNatsConnected(false)

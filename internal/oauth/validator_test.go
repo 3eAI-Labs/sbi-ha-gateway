@@ -526,3 +526,45 @@ func TestJWKS_ShortRefreshInterval(t *testing.T) {
 		t.Errorf("refresh 500ms: %v, want an error naming OAUTH_JWKS_REFRESH", err)
 	}
 }
+
+// A gateway started while the NRF was down becomes ready soon after the NRF answers, not one
+// refresh interval later: httprc schedules the fetch after a failed one at the full interval
+// (5 m by default), so the source retries every NegativeTTL while it holds no key.
+func TestJWKS_RecoversAfterFailedStart(t *testing.T) {
+	iss := newRSAIssuer(t, "k1")
+	var serve atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !serve.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(iss.publicSet)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	v, err := New(ctx, Config{
+		JWKS:     JWKSConfig{NRFURL: srv.URL, RefreshInterval: time.Hour, NegativeTTL: 100 * time.Millisecond},
+		Audience: "amf.local",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Ready(v) {
+		t.Fatal("ready without a key")
+	}
+	serve.Store(true)
+	deadline := time.Now().Add(3 * time.Second)
+	for !Ready(v) {
+		if time.Now().After(deadline) {
+			t.Fatal("not ready 3 s after the NRF answered")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tok := iss.sign(t, tokenOpts{sub: "x", aud: "amf.local", scope: "nausf-auth"})
+	if _, err := v.Validate(context.Background(), tok, nil); err != nil {
+		t.Errorf("Validate after recovery: %v", err)
+	}
+}

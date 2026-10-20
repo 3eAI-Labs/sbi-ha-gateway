@@ -48,8 +48,14 @@ Out of scope, because the gateway does not claim to handle them:
   `ALLOW_PLAINTEXT_SBI`, `MTLS_CLIENT_AUTH_MODE` `off`/`optional`, `OAUTH_DISABLED`.
   - Each one switched off is logged at start-up and shows as 0 in `sbi_gateway_security_protection`.
   - Rate limiting is off by default.
-- **The admin port** (`ADMIN_PORT`, default 9090: `/metrics`, `/health/*`, `/admin/stats`) has no
-  authentication. Keep it on a network only operators and the cluster can reach.
+- **The admin port** (`ADMIN_PORT`, default 9090: `/metrics`, `/health/*`, `/admin/stats`):
+  - By default `/metrics` and `/admin/*` require a bearer token (`ADMIN_TOKEN_FILE`), and the
+    port is served with the SBI certificate (`ADMIN_TLS`). `ADMIN_AUTH_DISABLED=true` and
+    `ADMIN_TLS=false` switch these off explicitly.
+  - The chart's NetworkPolicy admits only the release's namespace and `networkPolicy.adminFrom`.
+  - The health endpoints always answer without a token: the kubelet probes them.
+  - When either protection is off, a WARN at start-up and `sbi_gateway_security_protection`
+    (`admin_auth`, `admin_tls`) say so.
 - **NATS.** Whoever can publish on the gateway's subjects can make it answer network functions,
   send POST requests to a callback URI or SMSF address in their message, and send SMS. Those
   requests reach only the hosts `OUTBOUND_ALLOWED_DESTINATIONS` lists. The check runs on the

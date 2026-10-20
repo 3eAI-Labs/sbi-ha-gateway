@@ -198,3 +198,22 @@ sbi:TlsRequiredShape a sh:NodeShape ;
             }
         """ ;
     ] .
+
+# 6. TLS on the admin port — on by default, with the SBI certificate: outside a trial install it
+#    needs tls.existingSecret unless config.admin.tls=false; the chart refuses to render it
+#    otherwise. (The admin token needs no shape: without config.admin.tokenSecret the chart
+#    creates one.)
+sbi:AdminTlsRequiresTlsShape a sh:NodeShape ;
+    sh:targetClass sbi:ProductConfig ;
+    sh:sparql [
+        sh:message "Outside a trial install, the admin port is served with the SBI certificate: it needs tls.existingSecret, or config.admin.tls=false." ;
+        sh:select """
+            PREFIX sbi: <https://arinna.3eai-labs.com/ontology/sbi-ha-gateway#>
+            SELECT $this WHERE {
+                $this sbi:natsUrl ?nu . FILTER ( ?nu != "" )
+                FILTER NOT EXISTS { $this sbi:adminTls false }
+                OPTIONAL { $this sbi:tlsExistingSecret ?sec }
+                FILTER ( !BOUND(?sec) || ?sec = "" )
+            }
+        """ ;
+    ] .

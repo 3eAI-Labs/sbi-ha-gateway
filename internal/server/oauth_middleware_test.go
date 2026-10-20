@@ -25,10 +25,12 @@ import (
 
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/models"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/oauth"
+	cgaudit "github.com/3eAI-Labs/sbi-ha-gateway/internal/platform/audit"
 	tlsgen "github.com/3eAI-Labs/sbi-ha-gateway/internal/testutil/tlsgen"
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+	"sync"
 )
 
 // mintTokenWithCnf is mintToken with an RFC 8705 confirmation method.
@@ -352,5 +354,44 @@ func TestOAuthMiddleware_ChallengeFromHostilePath(t *testing.T) {
 		`error_description="token scope does not include the API's scope", scope="abc,d=e"`
 	if rec.Code != http.StatusForbidden || got != want {
 		t.Errorf("%d %s\nwant 403 %s", rec.Code, got, want)
+	}
+}
+
+type auditCapture struct {
+	mu     sync.Mutex
+	events []cgaudit.Event
+}
+
+func (c *auditCapture) Publish(_ string, data []byte) error {
+	var ev cgaudit.Event
+	_ = json.Unmarshal(data, &ev)
+	c.mu.Lock()
+	c.events = append(c.events, ev)
+	c.mu.Unlock()
+	return nil
+}
+
+// A request OAuth turns away is audited: an authentication failure is a security event,
+// whatever the method (C.7).
+func TestOAuthMiddleware_RefusalAudited(t *testing.T) {
+	v, signer, _ := mintTestValidator(t, "amf.local")
+	h := OAuthMiddleware(v)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	capture := &auditCapture{}
+	cgaudit.SetPublisher(capture, "audit.test")
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/nudm-sdm/v2/x", nil))
+	req := httptest.NewRequest("GET", "/nudm-sdm/v2/x", nil)
+	req.Header.Set("Authorization", "Bearer "+mintToken(t, signer, "x", "smf.local", "nudm-sdm", time.Time{}))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	cgaudit.SetPublisher(nil, "")
+
+	if len(capture.events) != 2 {
+		t.Fatalf("%d audit events, want 2", len(capture.events))
+	}
+	for i, cause := range []string{"missing_token", "wrong_audience"} {
+		ev := capture.events[i]
+		if ev.Outcome != "rejected" || ev.Status != http.StatusUnauthorized || ev.Cause != cause || ev.Resource != "nudm-sdm" || ev.UserID != "anonymous" {
+			t.Errorf("event %d: %+v, want rejected 401 %s", i, ev, cause)
+		}
 	}
 }

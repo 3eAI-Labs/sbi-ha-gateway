@@ -87,3 +87,19 @@ Milliseconds in a duration value: "500ms", "5s", "1m", "1h" (the forms the schem
 {{- else -}}{{ mul (trimSuffix "h" $v | int64) 3600000 }}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The Secret holding the admin port's token: config.admin.tokenSecret, or the one the chart
+creates (admin-token-secret.yaml).
+*/}}
+{{- define "sbi-ha-gateway.adminTokenSecret" -}}
+{{- .Values.config.admin.tokenSecret | default (printf "%s-admin-token" (include "sbi-ha-gateway.fullname" .)) -}}
+{{- end -}}
+
+{{/*
+"true" when the admin port is served with TLS: asked for, and a certificate to serve it with.
+Without tls.existingSecret only a trial install gets here (deployment.yaml fails the others).
+*/}}
+{{- define "sbi-ha-gateway.adminTLS" -}}
+{{- if and .Values.config.admin.tls .Values.tls.existingSecret }}true{{ end -}}
+{{- end -}}

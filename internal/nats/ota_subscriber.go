@@ -16,6 +16,7 @@ import (
 	"time"
 
 	sbiclient "github.com/3eAI-Labs/sbi-ha-gateway-client"
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/audit"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/outbound"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/uecm"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
@@ -322,6 +323,12 @@ func (s *OTASubscriber) handleSmsfMsg(msg jetstream.Msg) {
 		status, cause = sbiclient.DeliveryFailed, "RETRIES_EXHAUSTED"
 	}
 	metrics.RecordOtaSmsfSend(metricsResultFor(status, cause))
+	outcome := audit.Success
+	if status != sbiclient.DeliveryDelivered {
+		outcome = audit.Failed
+	}
+	audit.Action(context.Background(), "MtForwardSm", "nsmsf-sms", req.Routing.Supi,
+		endpointKey(buildSmsfMtURI(req.Routing.SmsfFqdn, req.Routing.Supi)), outcome, cause)
 	s.publishDelivery(DeliveryEvent{
 		TransactionID: txID,
 		Bearer:        "SBI",

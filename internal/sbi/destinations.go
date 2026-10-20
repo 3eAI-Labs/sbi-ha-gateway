@@ -24,11 +24,17 @@ var ErrDestinationNotAllowed = errors.New("outbound destination not allowed")
 // is resolved once, every address is checked, and the connection goes to a checked address,
 // so DNS cannot point an allowed name somewhere else in between. TLS still verifies the
 // name in the URI.
+//
+// A name is resolved only when an address could allow it: it matches a name rule, or the
+// policy has CIDR or address rules, or allows any. With name rules alone an unlisted name is
+// refused unresolved, so a URI cannot make the gateway query DNS for any name it carries.
 type Destinations struct {
 	allowAny bool
 	hosts    map[string]bool // exact names
 	suffixes []string        // ".example.com": that domain's subdomains
 	prefixes []netip.Prefix  // CIDR blocks and single addresses
+
+	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error) // nil: net.DefaultResolver
 }
 
 // ParseDestinations reads OUTBOUND_ALLOWED_DESTINATIONS: comma-separated host names
@@ -142,9 +148,17 @@ func (d *Destinations) DialContext(dial func(ctx context.Context, network, addr 
 			return dial(ctx, network, addr)
 		}
 		// A name that matches no name rule may still resolve into a listed CIDR block: the
-		// decision is on each resolved address.
+		// decision is on each resolved address. Without such a block, or allow-any, nothing
+		// could allow it, and it is not resolved.
 		byName := d.nameAllowed(host)
-		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		if !byName && !d.allowAny && len(d.prefixes) == 0 {
+			return nil, fmt.Errorf("%w: %s", ErrDestinationNotAllowed, host)
+		}
+		lookup := d.lookup
+		if lookup == nil {
+			lookup = net.DefaultResolver.LookupNetIP
+		}
+		ips, err := lookup(ctx, "ip", host)
 		if err != nil {
 			return nil, err
 		}

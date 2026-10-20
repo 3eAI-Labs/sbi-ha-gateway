@@ -60,8 +60,18 @@ gateway imports it; it never imports the gateway.
    - A reply from JetStream (a stream's publish acknowledgement, because a stream captures the
      subject), a reply the operation does not allow, or one that is not a JSON object: 500
      `SYSTEM_FAILURE`.
-5. For every operation but a GET the handler emits an audit event, named by the operationId, after a
-   successful reply, and none after an error reply or a failure.
+5. For every operation but a GET the handler emits an audit event, named by the operationId,
+   however it ended:
+   - `outcome` is `success`, `rejected` (a 4xx: the gateway's check or the application's
+     `ErrorReply`) or `failed` (a 5xx, no answer);
+   - it carries the HTTP status, the ProblemDetails cause and the request ID;
+   - the subscriber is masked and there is never a body.
+
+   An OAuth refusal is audited too (`AccessToken`, `rejected`, the reason), and so are the
+   notifications and SMS the gateway sends for applications (`DeliverNotification`,
+   `MtForwardSm`; user `nats`, `target` the network function). A publish NATS refuses is counted
+   (`sbi_gateway_audit_publish_failures_total`) and logged whole. At shutdown the queue is
+   published before the connection closes.
 
 ## Notification to a network function
 

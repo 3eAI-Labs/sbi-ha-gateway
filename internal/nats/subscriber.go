@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"slices"
 	"sync"
 	"time"
 
 	sbiclient "github.com/3eAI-Labs/sbi-ha-gateway-client"
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/audit"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/outbound"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/sbi"
@@ -213,8 +215,18 @@ func (s *Subscriber) process(data []byte) {
 	metrics.RecordOutboundDelivery(profile, out.result)
 	switch out.result {
 	case "ok", "failover", "bypassed":
+		target := endpointKey(endpoints[0])
+		if out.endpoint != "" {
+			target = endpointKey(out.endpoint)
+		}
+		audit.Action(s.ctx, "DeliverNotification", "notification", "", target, audit.Success, "")
 		return
 	}
+	outcome := audit.Failed
+	if out.result == sbiclient.NotifyClientError || out.result == sbiclient.NotifyNotAllowed {
+		outcome = audit.Rejected
+	}
+	audit.Action(s.ctx, "DeliverNotification", "notification", "", endpointKey(endpoints[0]), outcome, out.cause)
 	s.log.Error("Notification not delivered",
 		slog.String("result", out.result),
 		slog.String("cause", out.cause),
@@ -263,6 +275,7 @@ func withoutURI(err error) error {
 // notifyOutcome is how one notification's delivery ended.
 type notifyOutcome struct {
 	result   string // metric label; sbiclient.Notify* when not delivered
+	endpoint string // the URI that took it, when delivered
 	attempts int
 	status   int    // last HTTP status
 	body     []byte // and its body
@@ -288,6 +301,7 @@ func (s *Subscriber) deliverWithFailover(ctx context.Context, endpoints []string
 	passes, baseDelay := s.retryPolicy()
 	var out notifyOutcome
 	dropped := make([]bool, len(endpoints)) // refused by OUTBOUND_ALLOWED_DESTINATIONS
+	var lastFailure string                  // class of the last transient failure: 5xx, 429, transport
 passes:
 	for pass := 0; pass < passes; pass++ {
 		now := time.Now()
@@ -310,6 +324,9 @@ passes:
 			}
 
 			out.attempts++
+			if lastFailure != "" {
+				metrics.RecordCallbackRetry(lastFailure)
+			}
 			attemptCtx, cancel := context.WithTimeout(ctx, s.callbackTimeout)
 			_, err := s.outbound.Send(attemptCtx, &outbound.Request{
 				CallbackURI: uri,
@@ -328,7 +345,7 @@ passes:
 					slog.Int("pass", pass),
 				)
 				// Leaving the primary or its first try is a failover, not a clean OK.
-				out.result = "ok"
+				out.result, out.endpoint = "ok", uri
 				if pass > 0 || idx > 0 {
 					out.result = "failover"
 				}
@@ -358,12 +375,17 @@ passes:
 					return out
 				}
 				s.health.failed(uri, httpErr.RetryAfter, time.Now())
+				lastFailure = "5xx"
+				if httpErr.StatusCode == http.StatusTooManyRequests {
+					lastFailure = "429"
+				}
 			case ctx.Err() != nil:
 				out.cause = "SHUTDOWN"
 				break passes
 			default:
 				out.cause = "TRANSPORT_ERROR"
 				s.health.failed(uri, 0, time.Now())
+				lastFailure = "transport"
 			}
 			s.log.Warn("Endpoint delivery failed; trying next",
 				slog.String("endpoint", endpointKey(uri)),

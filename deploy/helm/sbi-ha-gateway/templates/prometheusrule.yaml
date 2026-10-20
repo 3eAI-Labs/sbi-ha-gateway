@@ -1,0 +1,78 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+{{- /* The series of this release, as the chart's ServiceMonitor scrapes them: job is the Service. */}}
+{{- $s := printf "job=%q" (include "sbi-ha-gateway.fullname" .) }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}
+  labels:
+    {{- include "sbi-ha-gateway.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: sbi-ha-gateway
+      rules:
+        - alert: SbiGatewayDown
+          expr: up{ {{ $s }} } == 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "sbi-ha-gateway {{ "{{ $labels.instance }}" }} cannot be scraped"
+        - alert: SbiGatewayNatsDisconnected
+          expr: sbi_gateway_nats_connection_status{ {{ $s }} } == 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "sbi-ha-gateway {{ "{{ $labels.instance }}" }} has no NATS connection: every SBI request fails"
+        - alert: SbiGatewayNoVerificationKey
+          expr: (sbi_gateway_oauth_jwks_keys{ {{ $s }} } == 0) and on(instance) (sbi_gateway_security_protection{ {{ $s }}, protection="oauth"} == 1)
+          for: 2m
+          labels: {severity: critical}
+          annotations:
+            summary: "sbi-ha-gateway {{ "{{ $labels.instance }}" }} holds no OAuth verification key: every token is rejected"
+        - alert: SbiGatewayHigh5xxRatio
+          expr: sum(rate(sbi_gateway_requests_total{ {{ $s }}, status=~"5.."}[5m])) / sum(rate(sbi_gateway_requests_total{ {{ $s }} }[5m])) > {{ .Values.metrics.prometheusRule.errorRatio }}
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "More than {{ mul .Values.metrics.prometheusRule.errorRatio 100 }}% of SBI requests end in a 5xx"
+        - alert: SbiGatewayOAuthRejections
+          expr: sum(rate(sbi_gateway_oauth_validations_total{ {{ $s }}, result="fail"}[5m])) / sum(rate(sbi_gateway_oauth_validations_total{ {{ $s }} }[5m])) > 0.2
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "More than 20% of access tokens are rejected"
+        - alert: SbiGatewayNotificationsUndelivered
+          expr: sum(increase(sbi_gateway_outbound_deliveries_total{ {{ $s }}, result=~"exhausted|client_error|not_allowed|not_implemented"}[10m])) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "Notifications were not delivered (reported on 5g.data.notify.failed)"
+        - alert: SbiGatewaySmsRetriesExhausted
+          expr: sum(increase(sbi_gateway_ota_smsf_sends_total{ {{ $s }}, result="retries_exhausted"}[10m])) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "MT SMS failed after every delivery: the SMSF failed transiently"
+        - alert: SbiGatewayAuditLoss
+          expr: (sum(increase(sbi_gateway_audit_events_total{ {{ $s }}, result="dropped"}[10m])) or vector(0)) + (sum(increase(sbi_gateway_audit_publish_failures_total{ {{ $s }} }[10m])) or vector(0)) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "Audit events were dropped or not published to NATS"
+        - alert: SbiGatewayNatsSlowConsumer
+          expr: sum(increase(sbi_gateway_nats_events_total{ {{ $s }}, event="slow_consumer"}[10m])) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "A NATS subscription fell behind and lost messages"
+        - alert: SbiGatewayCertificateExpiry
+          expr: sbi_gateway_tls_certificate_expiry_timestamp_seconds{ {{ $s }} } - time() < {{ .Values.metrics.prometheusRule.certificateExpiryDays }} * 86400
+          labels: {severity: warning}
+          annotations:
+            summary: "The {{ "{{ $labels.certificate }}" }} certificate of {{ "{{ $labels.instance }}" }} expires in less than {{ .Values.metrics.prometheusRule.certificateExpiryDays }} days"
+        - alert: SbiGatewayProtectionOff
+          expr: sbi_gateway_security_protection{ {{ $s }} } == 0
+          for: 15m
+          labels: {severity: info}
+          annotations:
+            summary: "Protection {{ "{{ $labels.protection }}" }} is switched off on {{ "{{ $labels.instance }}" }}"
+{{- end }}

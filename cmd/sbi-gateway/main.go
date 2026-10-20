@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -89,6 +90,25 @@ func RunWithContext(ctx context.Context) error {
 	if err != nil {
 		log.Error("TLS config build failed", slog.Any("error", err))
 		return err
+	}
+	// The admin port is protected by default, as the SBI port is: TLS with the SBI port's
+	// certificate, a bearer token on /metrics and /admin/*. Each is switched off only
+	// explicitly; reportSecurity says so.
+	if cfg.AdminTLS && tlsCfg == nil {
+		return errors.New("the admin port needs TLS, with the SBI port's certificate: set TLS_CERT_FILE and TLS_KEY_FILE, " +
+			"or ADMIN_TLS=false to serve it in cleartext")
+	}
+	var adminToken *admin.TokenFile
+	switch {
+	case cfg.AdminAuthDisabled && cfg.AdminTokenFile != "":
+		return errors.New("ADMIN_AUTH_DISABLED=true and ADMIN_TOKEN_FILE contradict each other: set one")
+	case !cfg.AdminAuthDisabled && cfg.AdminTokenFile == "":
+		return errors.New("the admin port needs a token: set ADMIN_TOKEN_FILE, " +
+			"or ADMIN_AUTH_DISABLED=true to answer /metrics and /admin/* without one")
+	case !cfg.AdminAuthDisabled:
+		if adminToken, err = admin.NewTokenFile(cfg.AdminTokenFile); err != nil {
+			return fmt.Errorf("ADMIN_TOKEN_FILE: %w", err)
+		}
 	}
 	if cfg.ShutdownDrainDelay < 0 || cfg.ShutdownTimeout <= 0 {
 		return fmt.Errorf("SHUTDOWN_DRAIN_DELAY (%s) must not be negative and SHUTDOWN_TIMEOUT (%s) must be positive",
@@ -232,12 +252,19 @@ func RunWithContext(ctx context.Context) error {
 	adminSrv := admin.NewAdminServer(nc)
 	if oauthValidator != nil {
 		// Without a verification key every token is rejected: not ready until the NRF answers.
-		adminSrv.AddReadinessCheck(func() bool { return oauth.Ready(oauthValidator) })
+		adminSrv.AddReadinessCheck("oauth_no_verification_key", func() bool { return oauth.Ready(oauthValidator) })
+	}
+	adminSrv.Log = log
+	if adminToken != nil {
+		adminSrv.RequireToken(adminToken)
 	}
 	adminHTTPSrv := adminSrv.HTTPServer(":" + cfg.AdminPort)
 	srv := sbiServer(":"+cfg.SBIPort, cfg.NatsRequestTimeout, tlsCfg != nil)
 	srv.Handler = r
 	srv.TLSConfig = tlsCfg
+	srv.ErrorLog = server.ErrorLog(log, "sbi")
+	adminHTTPSrv.ErrorLog = server.ErrorLog(log, "admin")
+	reportCertificates(log, cfg, tlsCfg)
 
 	// 6. Open both ports before serving either: a port that cannot be bound stops the
 	//    gateway instead of leaving a process whose readiness says it serves.
@@ -265,7 +292,20 @@ func RunWithContext(ctx context.Context) error {
 		log.Error("Server failed", slog.String("server", name), slog.Any("error", err))
 		stopServing()
 	}
+	if cfg.AdminTLS {
+		// The SBI port's certificate, without asking for the client's: the kubelet's probes
+		// and Prometheus present none. Cloned before either server serves: serving writes the
+		// HTTP/2 settings into the SBI server's tlsCfg.
+		adminTLS := tlsCfg.Clone()
+		adminTLS.ClientAuth, adminTLS.ClientCAs = tls.NoClientCert, nil
+		adminHTTPSrv.TLSConfig = adminTLS
+	}
 	go func() {
+		if cfg.AdminTLS {
+			log.Info("Admin server starting (TLS)", slog.String("port", cfg.AdminPort))
+			failed("admin server", adminHTTPSrv.ServeTLS(adminLn, "", ""))
+			return
+		}
 		log.Info("Admin server starting", slog.String("port", cfg.AdminPort))
 		failed("admin server", adminHTTPSrv.Serve(adminLn))
 	}()
@@ -336,6 +376,18 @@ func reportSecurity(log *slog.Logger, cfg *config.Config) {
 			log.Warn("SBI protection off", slog.String("protection", p.name), slog.String("setting", p.setting))
 		}
 	}
+	for _, p := range []struct {
+		name, setting string
+		on            bool
+	}{
+		{"admin_auth", "ADMIN_AUTH_DISABLED=true: /metrics and /admin/* answer without a token", !cfg.AdminAuthDisabled},
+		{"admin_tls", "ADMIN_TLS=false: the admin port serves cleartext", cfg.AdminTLS},
+	} {
+		metrics.SetSecurityProtection(p.name, p.on)
+		if !p.on {
+			log.Warn("Admin port protection off", slog.String("protection", p.name), slog.String("setting", p.setting))
+		}
+	}
 	if !cfg.OutboundAllowAny && strings.TrimSpace(cfg.OutboundAllowedDestinations) == "" {
 		log.Warn("No outbound destination allowed: notifications and SMS fail until " +
 			"OUTBOUND_ALLOWED_DESTINATIONS lists their hosts")
@@ -362,6 +414,22 @@ func sbiServer(addr string, natsRequestTimeout time.Duration, tls bool) *http.Se
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      max(30*time.Second, natsRequestTimeout+10*time.Second),
 		IdleTimeout:       120 * time.Second,
+	}
+}
+
+// reportCertificates sets the expiry gauge of each certificate the gateway presents: the SBI
+// port's (also the admin port's) and the outbound client certificate.
+func reportCertificates(log *slog.Logger, cfg *config.Config, sbiTLS *tls.Config) {
+	if sbiTLS != nil && len(sbiTLS.Certificates) > 0 && sbiTLS.Certificates[0].Leaf != nil {
+		metrics.SetCertificateExpiry("sbi", sbiTLS.Certificates[0].Leaf.NotAfter)
+	}
+	outbound, err := sbi.OutboundTLS(cfg.MTLSOutboundCertFile, cfg.MTLSOutboundKeyFile, cfg.MTLSOutboundCAFile)
+	if err != nil {
+		log.Warn("Outbound certificate not read for its expiry metric", slog.Any("error", err))
+		return
+	}
+	if outbound != nil && len(outbound.Certificates) > 0 && outbound.Certificates[0].Leaf != nil {
+		metrics.SetCertificateExpiry("outbound", outbound.Certificates[0].Leaf.NotAfter)
 	}
 }
 

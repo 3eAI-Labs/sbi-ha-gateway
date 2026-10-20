@@ -42,7 +42,7 @@ type JWKSConfig struct {
 	NRFURL          string        // e.g. https://nrf.5gc.local/oauth2/jwks
 	FilePath        string        // local JSON JWKS, used when NRFURL is empty
 	RefreshInterval time.Duration // foreground TTL, default 5m
-	NegativeTTL     time.Duration // how long to remember NRF fetch failures, default 30s
+	NegativeTTL     time.Duration // retry interval while no key is held, default 30s
 	// HTTPClient fetches from NRFURL: the NRF's trust anchor, the gateway's client
 	// certificate, a timeout. nil: system roots, no certificate, a 10 s timeout.
 	HTTPClient *http.Client
@@ -90,6 +90,29 @@ func (c *cachedKeySource) fetched(u string, in jwk.Set) (jwk.Set, error) {
 	metrics.RecordJWKSRefresh(true)
 	metrics.SetJWKSKeys(out.Len())
 	return out, nil
+}
+
+// retryWhileKeyless fetches from the NRF every retry while the source holds no key, until ctx
+// ends. httprc schedules the fetch after a failed one at the full refresh interval: a gateway
+// started while the NRF was down would otherwise stay unready, rejecting every token, for
+// OAUTH_JWKS_REFRESH (5 m by default).
+func (c *cachedKeySource) retryWhileKeyless(ctx context.Context, retry time.Duration, log *slog.Logger) {
+	tick := time.NewTicker(retry)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		if c.held() > 0 {
+			continue
+		}
+		if _, err := c.cache.Refresh(ctx, c.url); err != nil && ctx.Err() == nil {
+			metrics.RecordJWKSRefresh(false)
+			log.Warn("NRF JWKS fetch failed; no verification key yet", slog.String("url", c.url), slog.Any("error", err))
+		}
+	}
 }
 
 type staticKeySource struct{ set jwk.Set }
@@ -148,6 +171,7 @@ func loadKeySource(ctx context.Context, cfg JWKSConfig, log *slog.Logger) (keySo
 				slog.Any("error", err),
 			)
 		}
+		go src.retryWhileKeyless(ctx, cfg.NegativeTTL, log)
 		return src, nil
 	}
 

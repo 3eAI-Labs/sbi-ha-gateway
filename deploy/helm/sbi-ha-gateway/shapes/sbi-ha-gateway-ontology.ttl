@@ -81,6 +81,12 @@ sbi:mtlsOutboundCAFile a owl:DatatypeProperty ;
 sbi:allowPlaintextSbi a owl:DatatypeProperty ;
     rdfs:domain sbi:ProductConfig ; rdfs:range xsd:boolean ;
     rdfs:label "cleartext SBI port opt-out (config.security.allowPlaintextSbi)" .
+sbi:adminTls a owl:DatatypeProperty ;
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:boolean ;
+    rdfs:label "admin port TLS with the SBI certificate (config.admin.tls); false is an opt-out" .
+sbi:adminAuth a owl:DatatypeProperty ;
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:boolean ;
+    rdfs:label "admin port bearer token on /metrics and /admin/* (config.admin.auth); false is an opt-out" .
 sbi:outboundAllowAny a owl:DatatypeProperty ;
     rdfs:domain sbi:ProductConfig ; rdfs:range xsd:boolean ;
     rdfs:label "outbound destination allowlist opt-out (config.outbound.allowAny)" .
@@ -110,3 +116,6 @@ sbi:auditNatsSubject a owl:DatatypeProperty ;
 sbi:tlsExistingSecret a owl:DatatypeProperty ;
     rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string ;
     rdfs:label "TLS Secret name (tls.existingSecret) — secret-ref-only, never inline" .
+sbi:adminTokenSecret a owl:DatatypeProperty ;
+    rdfs:domain sbi:ProductConfig ; rdfs:range xsd:string ;
+    rdfs:label "admin token Secret name (config.admin.tokenSecret; empty: chart-generated) — secret-ref-only" .

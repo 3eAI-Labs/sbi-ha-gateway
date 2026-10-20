@@ -57,6 +57,8 @@ func insecureSBI(t *testing.T) {
 	t.Setenv("ALLOW_PLAINTEXT_SBI", "true")
 	t.Setenv("MTLS_CLIENT_AUTH_MODE", "off")
 	t.Setenv("OAUTH_DISABLED", "true")
+	t.Setenv("ADMIN_TLS", "false")
+	t.Setenv("ADMIN_AUTH_DISABLED", "true")
 }
 
 func TestRunWithContext(t *testing.T) {
@@ -108,6 +110,9 @@ func TestRunWithContext_RejectsInvalidSettings(t *testing.T) {
 		"negative RETRY_BASE_DELAY":     {"RETRY_BASE_DELAY", "-1s"},
 		"negative SHUTDOWN_DRAIN_DELAY": {"SHUTDOWN_DRAIN_DELAY", "-1s"},
 		"SHUTDOWN_TIMEOUT 0":            {"SHUTDOWN_TIMEOUT", "0s"},
+		"ADMIN_TLS without TLS":         {"ADMIN_TLS", "true"},
+		"no admin token":                {"ADMIN_AUTH_DISABLED", "false"},
+		"token and auth disabled":       {"ADMIN_TOKEN_FILE", "/etc/hostname"},
 		"OAUTH_DISABLED typo":           {"OAUTH_DISABLED", "fasle"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -383,11 +388,15 @@ func TestRunWithContext_SecureByDefault(t *testing.T) {
 	}{
 		{map[string]string{}, "ALLOW_PLAINTEXT_SBI"},
 		{map[string]string{"ALLOW_PLAINTEXT_SBI": "true"}, "MTLS_CLIENT_AUTH_MODE"},
-		{map[string]string{"ALLOW_PLAINTEXT_SBI": "true", "MTLS_CLIENT_AUTH_MODE": "off"}, "OAUTH_AUDIENCE"},
-		{map[string]string{"ALLOW_PLAINTEXT_SBI": "true", "MTLS_CLIENT_AUTH_MODE": "off", "OAUTH_DISABLED": "true"}, ""},
+		{map[string]string{"ALLOW_PLAINTEXT_SBI": "true", "MTLS_CLIENT_AUTH_MODE": "off"}, "ADMIN_TLS"},
+		{map[string]string{"ALLOW_PLAINTEXT_SBI": "true", "MTLS_CLIENT_AUTH_MODE": "off", "ADMIN_TLS": "false"}, "ADMIN_TOKEN_FILE"},
+		{map[string]string{"ALLOW_PLAINTEXT_SBI": "true", "MTLS_CLIENT_AUTH_MODE": "off", "ADMIN_TLS": "false",
+			"ADMIN_AUTH_DISABLED": "true"}, "OAUTH_AUDIENCE"},
+		{map[string]string{"ALLOW_PLAINTEXT_SBI": "true", "MTLS_CLIENT_AUTH_MODE": "off", "ADMIN_TLS": "false",
+			"ADMIN_AUTH_DISABLED": "true", "OAUTH_DISABLED": "true"}, ""},
 	} {
 		t.Run(c.want, func(t *testing.T) {
-			for _, k := range []string{"ALLOW_PLAINTEXT_SBI", "MTLS_CLIENT_AUTH_MODE", "OAUTH_DISABLED"} {
+			for _, k := range []string{"ALLOW_PLAINTEXT_SBI", "MTLS_CLIENT_AUTH_MODE", "OAUTH_DISABLED", "ADMIN_TLS", "ADMIN_AUTH_DISABLED"} {
 				t.Setenv(k, c.env[k])
 			}
 			t.Setenv("NATS_URL", s.ClientURL())
@@ -558,5 +567,104 @@ func TestRunWithContext_NotReadyWithoutJWKS(t *testing.T) {
 		assert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("no shutdown")
+	}
+}
+
+// The admin port over TLS with the SBI certificate and a token: the health endpoints answer
+// without one, /metrics only with it, and cleartext is refused (A.11).
+func TestRunWithContext_AdminTLSAndToken(t *testing.T) {
+	insecureSBI(t)
+	s := runServer(nil)
+	defer s.Shutdown()
+	dir := t.TempDir()
+	certPath, keyPath := tlsgen.NewCA(t).Sign(t, tlsgen.LeafSpec{CommonName: "udm.test", IPs: []net.IP{net.ParseIP("127.0.0.1")}}).WriteFiles(t, dir, "sbi")
+	tokenPath := filepath.Join(dir, "admin-token")
+	if err := os.WriteFile(tokenPath, []byte("s3cret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adminPort := freePort(t)
+	t.Setenv("ALLOW_PLAINTEXT_SBI", "false")
+	t.Setenv("TLS_CERT_FILE", certPath)
+	t.Setenv("TLS_KEY_FILE", keyPath)
+	t.Setenv("ADMIN_TLS", "true")
+	t.Setenv("ADMIN_AUTH_DISABLED", "false")
+	t.Setenv("ADMIN_TOKEN_FILE", tokenPath)
+	t.Setenv("NATS_URL", s.ClientURL())
+	t.Setenv("SBI_PORT", freePort(t))
+	t.Setenv("ADMIN_PORT", adminPort)
+	t.Setenv("SHUTDOWN_DRAIN_DELAY", "0s")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- RunWithContext(ctx) }()
+
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 -- test: the probe does not verify either
+	}}
+	base := "https://127.0.0.1:" + adminPort
+	status := func(path, token string) int {
+		req, _ := http.NewRequest(http.MethodGet, base+path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for status("/health/ready", "") != http.StatusOK {
+		if time.Now().After(deadline) {
+			t.Fatal("admin port not ready over TLS")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	assert.Equal(t, http.StatusOK, status("/health/live", ""))
+	assert.Equal(t, http.StatusUnauthorized, status("/metrics", ""))
+	assert.Equal(t, http.StatusOK, status("/metrics", "s3cret"))
+	handshakes := func() float64 {
+		var m dto.Metric
+		_ = metrics.TLSHandshakeFailures.WithLabelValues("admin").Write(&m)
+		return m.GetCounter().GetValue()
+	}
+	before := handshakes()
+	if code, err := get("http://127.0.0.1:" + adminPort + "/health/live"); err == nil && code == http.StatusOK {
+		t.Error("the admin port answered cleartext")
+	}
+	// The cleartext attempt is a handshake the admin port did not complete (C.8), and the
+	// SBI certificate's expiry is exported.
+	assert.Eventually(t, func() bool { return handshakes() > before }, 2*time.Second, 20*time.Millisecond)
+	var expiry dto.Metric
+	_ = metrics.TLSCertificateExpiry.WithLabelValues("sbi").Write(&expiry)
+	assert.Greater(t, expiry.GetGauge().GetValue(), float64(time.Now().Unix()), "certificate expiry")
+
+	cancel()
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no shutdown")
+	}
+}
+
+// An admin token file that cannot be read, or is empty, stops the gateway.
+func TestRunWithContext_AdminTokenFileUnusable(t *testing.T) {
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/nonexistent", empty} {
+		insecureSBI(t)
+		t.Setenv("ADMIN_AUTH_DISABLED", "false")
+		t.Setenv("ADMIN_TOKEN_FILE", path)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := RunWithContext(ctx)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), "ADMIN_TOKEN_FILE") {
+			t.Errorf("%s: %v, want an error naming ADMIN_TOKEN_FILE", path, err)
+		}
 	}
 }

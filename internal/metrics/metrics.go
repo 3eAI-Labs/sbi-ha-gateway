@@ -4,8 +4,10 @@
 package metrics
 
 import (
+	cgaudit "github.com/3eAI-Labs/sbi-ha-gateway/internal/platform/audit"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"time"
 )
 
 var (
@@ -80,12 +82,45 @@ var (
 		},
 	)
 
-	// CallbackRetries counts callback delivery retries
+	// TLSCertificateExpiry is the NotAfter of each certificate the gateway presents, as Unix
+	// time: certificate sbi (the SBI and admin ports) or outbound (callbacks, SMSF, NRF).
+	TLSCertificateExpiry = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "sbi_gateway",
+			Name:      "tls_certificate_expiry_timestamp_seconds",
+			Help:      "Unix time a certificate the gateway presents expires",
+		},
+		[]string{"certificate"},
+	)
+
+	// TLSHandshakeFailures counts TLS handshakes a port did not complete: port sbi or admin.
+	TLSHandshakeFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "sbi_gateway",
+			Name:      "tls_handshake_failures_total",
+			Help:      "TLS handshakes not completed, by port",
+		},
+		[]string{"port"},
+	)
+
+	// NatsEvents counts NATS connection events: disconnected, reconnected, slow_consumer
+	// (messages dropped because a subscription fell behind), error.
+	NatsEvents = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "sbi_gateway",
+			Name:      "nats_events_total",
+			Help:      "NATS connection events",
+		},
+		[]string{"event"},
+	)
+
+	// CallbackRetries counts notification attempts after a failed one, by what failed last:
+	// status 5xx, 429 or transport.
 	CallbackRetries = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "sbi_gateway",
 			Name:      "callback_retries_total",
-			Help:      "Total callback delivery retry attempts",
+			Help:      "Notification attempts after a failed one, by the last failure",
 		},
 		[]string{"status"},
 	)
@@ -216,6 +251,13 @@ var (
 	// AuditEvents counts audit.Log emissions by outcome:
 	//   emitted  — accepted into the publisher queue (or slog fallback)
 	//   dropped  — queue full; event lost (operator must size queue / NATS)
+	// AuditPublishFailures counts audit events NATS refused; each was logged instead, whole.
+	AuditPublishFailures = promauto.NewCounterFunc(prometheus.CounterOpts{
+		Namespace: "sbi_gateway",
+		Name:      "audit_publish_failures_total",
+		Help:      "Audit events the publisher refused (logged instead)",
+	}, func() float64 { return float64(cgaudit.PublishFailures()) })
+
 	AuditEvents = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "sbi_gateway",
@@ -260,6 +302,21 @@ func IncActiveRequests() {
 // DecActiveRequests decrements active request count
 func DecActiveRequests() {
 	ActiveRequests.Dec()
+}
+
+// SetCertificateExpiry records when certificate expires.
+func SetCertificateExpiry(certificate string, notAfter time.Time) {
+	TLSCertificateExpiry.WithLabelValues(certificate).Set(float64(notAfter.Unix()))
+}
+
+// RecordTLSHandshakeFailure counts a TLS handshake port did not complete.
+func RecordTLSHandshakeFailure(port string) {
+	TLSHandshakeFailures.WithLabelValues(port).Inc()
+}
+
+// RecordNatsEvent counts a NATS connection event.
+func RecordNatsEvent(event string) {
+	NatsEvents.WithLabelValues(event).Inc()
 }
 
 // RecordCallbackRetry records a callback retry attempt

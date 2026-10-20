@@ -6,8 +6,10 @@ package admin_test
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,9 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"os"
+	"path/filepath"
 )
 
 type MockNatsClient struct {
@@ -121,7 +126,7 @@ func TestAdminServer_HealthReady_Check(t *testing.T) {
 	mockNats.On("IsConnected").Return(true)
 	srv := admin.NewAdminServer(mockNats)
 	var ok bool
-	srv.AddReadinessCheck(func() bool { return ok })
+	srv.AddReadinessCheck("test_check", func() bool { return ok })
 	r := srv.SetupRouter()
 
 	for _, want := range []int{http.StatusServiceUnavailable, http.StatusOK} {
@@ -130,4 +135,86 @@ func TestAdminServer_HealthReady_Check(t *testing.T) {
 		assert.Equal(t, want, w.Code)
 		ok = true
 	}
+}
+
+// With a token, /metrics and /admin/* answer only requests carrying it; the health endpoints
+// stay open for the kubelet.
+func TestAdminServer_Token(t *testing.T) {
+	mockNats := new(MockNatsClient)
+	mockNats.On("IsConnected").Return(true)
+	srv := admin.NewAdminServer(mockNats)
+	srv.RequireToken(tokenFile(t, "s3cret"))
+	r := srv.SetupRouter()
+
+	for _, c := range []struct {
+		path, authz string
+		want        int
+	}{
+		{"/metrics", "", http.StatusUnauthorized},
+		{"/metrics", "Bearer wrong", http.StatusUnauthorized},
+		{"/metrics", "Basic s3cret", http.StatusUnauthorized},
+		{"/metrics", "Bearer s3cret", http.StatusOK},
+		{"/admin/stats", "", http.StatusUnauthorized},
+		{"/admin/stats", "Bearer s3cret", http.StatusOK},
+		{"/health/live", "", http.StatusOK},
+		{"/health/ready", "", http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodGet, c.path, nil)
+		if c.authz != "" {
+			req.Header.Set("Authorization", c.authz)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		assert.Equal(t, c.want, w.Code, "%s %q", c.path, c.authz)
+	}
+}
+
+// A 503 says why, and readiness is logged when it changes, not at every probe.
+func TestAdminServer_ReadyReasons(t *testing.T) {
+	mockNats := new(MockNatsClient)
+	mockNats.On("IsConnected").Return(false)
+	var logs strings.Builder
+	srv := admin.NewAdminServer(mockNats)
+	srv.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	srv.AddReadinessCheck("oauth_no_verification_key", func() bool { return false })
+	srv.Drain()
+	r := srv.SetupRouter()
+
+	for range 3 {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		assert.JSONEq(t, `{"ready":false,"reasons":["draining","nats_disconnected","oauth_no_verification_key"]}`, w.Body.String())
+	}
+	assert.Equal(t, 1, strings.Count(logs.String(), "Not ready"), logs.String())
+}
+
+func tokenFile(t *testing.T, token string) *admin.TokenFile {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(path, []byte(token+"\n"), 0o600))
+	tf, err := admin.NewTokenFile(path)
+	require.NoError(t, err)
+	return tf
+}
+
+// A rotated token takes effect without a restart: the file is read again after tokenReread.
+// A file that cannot be read then leaves the last token in force.
+func TestTokenFile_Rotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(path, []byte("old\n"), 0o600))
+	tf, err := admin.NewTokenFile(path)
+	require.NoError(t, err)
+	now := time.Now()
+	assert.Equal(t, "old", string(admin.TokenAt(tf, now)))
+
+	require.NoError(t, os.WriteFile(path, []byte("new\n"), 0o600))
+	assert.Equal(t, "old", string(admin.TokenAt(tf, now.Add(time.Second))), "read again before tokenReread")
+	assert.Equal(t, "new", string(admin.TokenAt(tf, now.Add(11*time.Second))))
+
+	require.NoError(t, os.Remove(path))
+	assert.Equal(t, "new", string(admin.TokenAt(tf, now.Add(30*time.Second))), "the last token stays when the file is gone")
+
+	_, err = admin.NewTokenFile(path)
+	assert.Error(t, err, "a missing file at start")
 }
