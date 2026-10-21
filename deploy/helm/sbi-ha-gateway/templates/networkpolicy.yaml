@@ -1,6 +1,6 @@
 {{- if .Values.networkPolicy.enabled }}
 # Ingress to the gateway pods (values.yaml, networkPolicy): the SBI port from sbiFrom, or from
-# anywhere when it is empty; the admin port, which has no authentication, only from pods in
+# anywhere when it is empty; the admin port (its token and TLS: config.admin) only from pods in
 # this namespace and from adminFrom.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -193,9 +193,9 @@ extraVolumes: []
 extraVolumeMounts: []
 
 # Ingress to the gateway pods. The SBI port is reachable from sbiFrom (empty: anywhere); the
-# admin port (metrics, health, stats — no authentication) only from pods in the release's
-# namespace and from adminFrom (add your Prometheus here). Kubelet probes are not peers of a
-# NetworkPolicy on common CNIs (verified on kind's kindnet).
+# admin port (metrics, health, stats; its token and TLS: config.admin) only from pods in the
+# release's namespace and from adminFrom (add your Prometheus here). Kubelet probes are not
+# peers of a NetworkPolicy on common CNIs (verified on kind's kindnet).
 networkPolicy:
   enabled: true
   sbiFrom: []

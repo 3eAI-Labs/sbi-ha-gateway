@@ -9,7 +9,7 @@ SMS platform.
 The gateway keeps no subscriber state. Replicas share the work through NATS queue groups and a
 JetStream work queue, so it scales horizontally.
 
-**Status: 0.4.0; 0.2.0 was the first public release.** It has not carried traffic on a production network.
+**Status: 0.4.1; 0.2.0 was the first public release.** It has not carried traffic on a production network.
 Read [Known limitations](#known-limitations) before relying on it.
 
 ## How it works

@@ -1,8 +1,8 @@
 # Build Stage
-# Base must satisfy go.mod's `go 1.26.9`: the image sets GOTOOLCHAIN=local and will not
+# Base must satisfy go.mod's `go 1.26.10`: the image sets GOTOOLCHAIN=local and will not
 # fetch a newer toolchain. Module downloads are a cached layer: go.mod and go.sum are
 # copied before the sources.
-FROM golang:1.26.9-alpine AS builder
+FROM golang:1.26.10-alpine AS builder
 
 WORKDIR /app
 

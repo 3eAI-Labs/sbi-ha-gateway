@@ -15,7 +15,7 @@ import (
 )
 
 func TestExtractNFInstanceID_PrefixMatch(t *testing.T) {
-	u, _ := url.Parse("urn:5g:nf-instance-id:550e8400-e29b-41d4-a716-446655440000")
+	u, _ := url.Parse("urn:uuid:550e8400-e29b-41d4-a716-446655440000")
 	cert := &x509.Certificate{URIs: []*url.URL{u}}
 	got := extractNFInstanceID(cert)
 	want := "550e8400-e29b-41d4-a716-446655440000"
@@ -25,8 +25,8 @@ func TestExtractNFInstanceID_PrefixMatch(t *testing.T) {
 }
 
 func TestExtractNFInstanceID_FirstMatchWins(t *testing.T) {
-	first, _ := url.Parse("urn:5g:nf-instance-id:first")
-	second, _ := url.Parse("urn:5g:nf-instance-id:second")
+	first, _ := url.Parse("urn:uuid:first")
+	second, _ := url.Parse("urn:uuid:second")
 	cert := &x509.Certificate{URIs: []*url.URL{first, second}}
 	if got := extractNFInstanceID(cert); got != "first" {
 		t.Errorf("got %q, want first", got)
@@ -35,10 +35,28 @@ func TestExtractNFInstanceID_FirstMatchWins(t *testing.T) {
 
 func TestExtractNFInstanceID_IgnoresNonNFURIs(t *testing.T) {
 	other, _ := url.Parse("https://amf-1.5gc.local/")
-	nf, _ := url.Parse("urn:5g:nf-instance-id:correct")
+	nf, _ := url.Parse("urn:uuid:correct")
 	cert := &x509.Certificate{URIs: []*url.URL{other, nf}}
 	if got := extractNFInstanceID(cert); got != "correct" {
 		t.Errorf("expected non-3GPP URIs to be skipped; got %q", got)
+	}
+}
+
+// The URN namespace and the UUID are case-insensitive; the ID comes back in lower case.
+func TestExtractNFInstanceID_CaseInsensitive(t *testing.T) {
+	u, _ := url.Parse("URN:UUID:550E8400-E29B-41D4-A716-446655440000")
+	cert := &x509.Certificate{URIs: []*url.URL{u}}
+	if got, want := extractNFInstanceID(cert), "550e8400-e29b-41d4-a716-446655440000"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// 0.4.0 and earlier read "urn:5g:nf-instance-id:", which no 3GPP profile defines.
+func TestExtractNFInstanceID_IgnoresPre041Prefix(t *testing.T) {
+	old, _ := url.Parse("urn:5g:nf-instance-id:550e8400-e29b-41d4-a716-446655440000")
+	cert := &x509.Certificate{URIs: []*url.URL{old}}
+	if got := extractNFInstanceID(cert); got != "" {
+		t.Errorf("expected empty, got %q", got)
 	}
 }
 
@@ -85,7 +103,7 @@ func TestPeerIdentityMiddleware_NoPeerCert_Passthrough(t *testing.T) {
 
 func TestPeerIdentityMiddleware_InjectsIdentity(t *testing.T) {
 	ca := tlsgen.NewCA(t)
-	uri, _ := url.Parse("urn:5g:nf-instance-id:amf-uuid-42")
+	uri, _ := url.Parse("urn:uuid:amf-uuid-42")
 	leaf := ca.Sign(t, tlsgen.LeafSpec{
 		CommonName: "amf-1",
 		URIs:       []*url.URL{uri},

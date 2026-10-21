@@ -71,7 +71,7 @@ func NewCA(t *testing.T) *CA {
 type LeafSpec struct {
 	CommonName string
 	DNSNames   []string
-	URIs       []*url.URL // 3GPP TS 33.310 URI SAN: urn:5g:nf-instance-id:<UUID>
+	URIs       []*url.URL // 3GPP TS 33.310 URI SAN: urn:uuid:<UUID>
 	IPs        []net.IP
 	IsClient   bool // true → client auth EKU; false → server auth EKU
 }

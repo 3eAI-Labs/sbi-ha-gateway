@@ -169,16 +169,19 @@
           "properties": {
             "auth": {
               "type": "boolean",
-              "description": "/metrics and /admin/* require a bearer token. false is an explicit opt-out (a WARN and sbi_gateway_security_protection{protection=\"admin_auth\"} 0 say so)."
+              "description": "/metrics and /admin/* require a bearer token. false is an explicit opt-out (a WARN and sbi_gateway_security_protection{protection=\"admin_auth\"} 0 say so). A high-risk security change.",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
             },
             "tokenSecret": {
               "type": "string",
-              "description": "Secret holding the bearer token. Empty: the chart creates <fullname>-admin-token with a random token."
+              "description": "Secret holding the bearer token. Empty: the chart creates <fullname>-admin-token with a random token.",
+              "x-arinna": { "userExposed": false, "secretRef": true, "requiresApproval": true, "riskClass": "high" }
             },
             "tokenKey": { "type": "string", "minLength": 1, "description": "Key of the token in tokenSecret." },
             "tls": {
               "type": "boolean",
-              "description": "Serve the admin port with tls.existingSecret's certificate; the probes use HTTPS. false is an explicit opt-out; a trial install without TLS switches it off itself."
+              "description": "Serve the admin port with tls.existingSecret's certificate; the probes use HTTPS. false is an explicit opt-out; a trial install without TLS switches it off itself. A high-risk security change.",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
             }
           }
         },
@@ -406,7 +409,7 @@
     "networkPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Ingress to the gateway pods: the SBI port from sbiFrom (empty: anywhere); the admin port, which has no authentication, from pods in the release namespace and adminFrom.",
+      "description": "Ingress to the gateway pods: the SBI port from sbiFrom (empty: anywhere); the admin port (its token and TLS: config.admin) from pods in the release namespace and adminFrom.",
       "properties": {
         "enabled": {
           "type": "boolean",
@@ -460,8 +463,15 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "enabled": { "type": "boolean", "description": "Render a Prometheus Operator ServiceMonitor for the admin port's /metrics (admin token and TLS included)." },
-            "interval": { "type": "string", "pattern": "^[1-9][0-9]*(s|m)$" },
+            "enabled": {
+              "type": "boolean",
+              "description": "Render a Prometheus Operator ServiceMonitor for the admin port's /metrics (admin token and TLS included).",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+            },
+            "interval": {
+              "type": "string", "pattern": "^[1-9][0-9]*(s|m)$",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+            },
             "labels": { "type": "object", "additionalProperties": { "type": "string" } },
             "tlsConfig": { "type": "object", "description": "The ServiceMonitor endpoint's tlsConfig, with config.admin.tls." }
           }
@@ -470,10 +480,20 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "enabled": { "type": "boolean", "description": "Render a PrometheusRule with the gateway's alerts; they select the series the chart's ServiceMonitor scrapes." },
+            "enabled": {
+              "type": "boolean",
+              "description": "Render a PrometheusRule with the gateway's alerts; they select the series the chart's ServiceMonitor scrapes.",
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+            },
             "labels": { "type": "object", "additionalProperties": { "type": "string" } },
-            "errorRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
-            "certificateExpiryDays": { "type": "integer", "minimum": 1 }
+            "errorRatio": {
+              "type": "number", "exclusiveMinimum": 0, "maximum": 1,
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+            },
+            "certificateExpiryDays": {
+              "type": "integer", "minimum": 1,
+              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+            }
           }
         }
       }

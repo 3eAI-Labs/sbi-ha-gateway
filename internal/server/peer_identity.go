@@ -11,18 +11,19 @@ import (
 	"strings"
 )
 
-// 3GPP TS 33.310 §6.1.3c says the NF instance identity in a TLS client cert
-// is carried in a URI SAN of the form "urn:5g:nf-instance-id:<UUID>". We
-// match that prefix exactly — no fuzzy parsing, no fallback to CN, because
-// CN-based identity has been deprecated since RFC 6125 (2011) and is the
-// usual source of bypass-via-CN-spoofing CVEs in mTLS implementations.
-const nfInstanceIDURIPrefix = "urn:5g:nf-instance-id:"
+// 3GPP TS 33.310 §6.1.3c.3 puts the NF instance identity of an NF certificate in a URI-ID
+// subjectAltName: the NF instance ID (TS 29.571 §5.3.2, a UUID) as a URN, "urn:uuid:<UUID>"
+// (NOTE 1). The prefix is matched exactly but for case — the URN namespace and the UUID's
+// hex digits are case-insensitive (RFC 8141, RFC 4122) — with no fallback to the CN, because
+// CN-based identity has been deprecated since RFC 6125 (2011) and is the usual source of
+// bypass-via-CN-spoofing CVEs in mTLS implementations.
+const nfInstanceIDURIPrefix = "urn:uuid:"
 
 // PeerIdentity is the trusted identity extracted from a verified client cert.
 // "Trusted" here means the cert chain was verified against ClientCAs by the
 // TLS stack before this struct was populated — we do not re-verify.
 type PeerIdentity struct {
-	NFInstanceID string            // empty when no URI SAN matched the 3GPP prefix
+	NFInstanceID string            // lower case; empty when no URI SAN matched the 3GPP prefix
 	Cert         *x509.Certificate // the leaf cert, kept so RFC 8705 binding can hash it
 }
 
@@ -71,18 +72,17 @@ func PeerIdentityMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// extractNFInstanceID returns the NF instance ID from the cert's URI SANs,
-// or "" if none match the 3GPP prefix. The first matching URI wins —
-// presenting multiple distinct NF identities in one cert would itself be a
-// configuration bug.
+// extractNFInstanceID returns the NF instance ID from the cert's URI SANs, in lower case,
+// or "" if none match the 3GPP prefix. The first matching URI wins — presenting multiple
+// distinct NF identities in one cert would itself be a configuration bug.
 func extractNFInstanceID(cert *x509.Certificate) string {
 	for _, u := range cert.URIs {
 		if u == nil {
 			continue
 		}
 		s := u.String()
-		if strings.HasPrefix(s, nfInstanceIDURIPrefix) {
-			return strings.TrimPrefix(s, nfInstanceIDURIPrefix)
+		if len(s) > len(nfInstanceIDURIPrefix) && strings.EqualFold(s[:len(nfInstanceIDURIPrefix)], nfInstanceIDURIPrefix) {
+			return strings.ToLower(s[len(nfInstanceIDURIPrefix):])
 		}
 	}
 	return ""

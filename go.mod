@@ -1,6 +1,6 @@
 module github.com/3eAI-Labs/sbi-ha-gateway
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/3eAI-Labs/sbi-ha-gateway-client v0.3.0

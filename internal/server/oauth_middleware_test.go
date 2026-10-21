@@ -58,7 +58,7 @@ func mintTokenWithCnf(t *testing.T, signer jwk.Key, sub, aud, scope string, cert
 func genTestLeaf(t *testing.T) (*x509.Certificate, []byte, []byte) {
 	t.Helper()
 	ca := tlsgen.NewCA(t)
-	uri, _ := url.Parse("urn:5g:nf-instance-id:test-uuid")
+	uri, _ := url.Parse("urn:uuid:test-uuid")
 	leaf := ca.Sign(t, tlsgen.LeafSpec{
 		CommonName: "test-peer",
 		URIs:       []*url.URL{uri},

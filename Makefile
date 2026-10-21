@@ -7,7 +7,7 @@ export GOWORK := off
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build vet test test-short coverage lint fmt licenses image image-smoke run clean
+.PHONY: help build vet test test-short coverage lint fmt fmt-check licenses image image-smoke run clean
 
 help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -34,6 +34,9 @@ lint: ## golangci-lint when installed, go vet otherwise
 
 fmt: ## gofmt the tree
 	gofmt -w $$(git ls-files '*.go')
+
+fmt-check: ## Fail when a file is not gofmt'd (CI runs this)
+	@out=$$(gofmt -l $$(git ls-files '*.go')); if [ -n "$$out" ]; then echo "not gofmt'd (make fmt):"; echo "$$out"; exit 1; fi
 
 licenses: ## Check licence headers and dependency licences
 	scripts/check-licenses.sh

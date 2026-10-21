@@ -107,9 +107,10 @@ func (t *TokenFile) current(now time.Time) []byte {
 	return t.token
 }
 
-// notReady lists why the gateway is not ready; none when it is.
+// notReady lists why the gateway is not ready; an empty list, not nil, when it is: the
+// readiness answer then says "reasons":[] rather than null.
 func (s *AdminServer) notReady() []string {
-	var reasons []string
+	reasons := []string{}
 	if s.draining.Load() {
 		reasons = append(reasons, "draining")
 	}

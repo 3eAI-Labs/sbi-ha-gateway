@@ -60,6 +60,8 @@ func TestAdminServer_HealthReady_Connected(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
+	// An empty list, not null: a consumer can iterate it without a nil check.
+	assert.JSONEq(t, `{"ready":true,"reasons":[]}`, w.Body.String())
 }
 
 func TestAdminServer_HealthReady_Disconnected(t *testing.T) {
@@ -110,8 +112,8 @@ func TestAdminServer_Stats(t *testing.T) {
 	assert.Equal(t, true, stats["nats_connected"])
 }
 
-// The admin port has no authentication: a slow or idle client must not hold a
-// connection open.
+// The health endpoints are open to anyone who reaches the admin port: a slow or idle
+// client must not hold a connection open.
 func TestHTTPServer_Timeouts(t *testing.T) {
 	srv := admin.NewAdminServer(nil).HTTPServer(":0")
 	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.WriteTimeout <= 0 || srv.IdleTimeout <= 0 {

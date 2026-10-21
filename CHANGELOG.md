@@ -8,6 +8,37 @@ Versions up to 1.0.0 were released privately. 0.2.0 is the first public release:
 goes down on purpose, because the gateway stays below 1.0 until it has carried traffic on a
 production network. Its entry describes what changed for an installation of 1.0.0.
 
+## [0.4.1] — 2026-10-21
+
+The four findings of 0.4.0's release, and Go 1.26.10 for a crypto/x509 vulnerability published
+after it. Not breaking: the configuration, the chart's defaults and the NATS contract
+(`sbi-ha-gateway-client` v0.3.0) are unchanged. An audit consumer sees the peer's NF instance ID
+where 0.4.0 wrote `anonymous`. Chart 0.4.1 deploys 0.4.1.
+
+### Fixed
+
+- **The peer's NF instance ID is read from the URI SAN TS 33.310 defines.** The NF certificate
+  profile (TS 33.310 clause 6.1.3c.3) carries the NF instance ID as `urn:uuid:<UUID>`. 0.4.0 and
+  earlier read only `urn:5g:nf-instance-id:`, which no 3GPP profile defines, so an OAuth refusal of
+  a conforming client was audited with user `anonymous`. The URN namespace and the UUID are matched
+  case-insensitively and the ID is written in lower case. A certificate carrying only the old form
+  is now audited as `anonymous`. The ID is used for that audit field alone; no check changes.
+- **`/health/ready` answers `"reasons":[]` when ready,** where 0.4.0 wrote `null`.
+- **Chart: Arinna can tune 0.4.0's values.** `config.admin.auth` and `config.admin.tls` are
+  high-risk, approval-gated changes like the other protections; `config.admin.tokenSecret` is a
+  Secret reference; `metrics.serviceMonitor` and `metrics.prometheusRule` (enabled, interval,
+  thresholds) are low-risk. Chart 0.4.0 carried no `x-arinna` on them, so Arinna could install
+  only the defaults.
+- **Chart: the NetworkPolicy's description no longer says the admin port has no
+  authentication;** it has its token and TLS since 0.4.0.
+
+### Security
+
+- **Built with Go 1.26.10,** which fixes GO-2026-6809 ("Distrust compromised intermediate
+  certificates in crypto/x509"). 0.4.0 was built with Go 1.26.9, and govulncheck finds the
+  gateway's code reaching the affected crypto/x509 code. The SBI port, the admin port and the
+  outbound calls all verify certificates with it.
+
 ## [0.4.0] — 2026-10-20
 
 The admin port's protection, and the hardening 0.3.0's end-to-end run asked for. Breaking for
