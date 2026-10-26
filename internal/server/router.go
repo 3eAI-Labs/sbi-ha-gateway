@@ -25,6 +25,10 @@ type RouterConfig struct {
 
 	// Logger receives the access lines; nil means slog.Default().
 	Logger *slog.Logger
+
+	// NRFNotifications mounts the callback of the gateway's NRF subscriptions; nil: none.
+	// Its path needs no access token (oauth.RequiredScope).
+	NRFNotifications func(chi.Router)
 }
 
 func NewRouter(cfg RouterConfig) *chi.Mux {
@@ -44,6 +48,9 @@ func NewRouter(cfg RouterConfig) *chi.Mux {
 	r.Use(OAuthMiddleware(cfg.OAuthValidator))
 	r.Use(NFRateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst))
 
+	if cfg.NRFNotifications != nil {
+		cfg.NRFNotifications(r)
+	}
 	if cfg.SBI != nil {
 		cfg.SBI.RegisterRoutes(r)
 	}

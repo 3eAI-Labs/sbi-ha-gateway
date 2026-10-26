@@ -8,6 +8,205 @@ Versions up to 1.0.0 were released privately. 0.2.0 is the first public release:
 goes down on purpose, because the gateway stays below 1.0 until it has carried traffic on a
 production network. Its entry describes what changed for an installation of 1.0.0.
 
+## [0.5.0] — 2026-10-26
+
+Registration with the NRF (TS 29.510), access tokens from it, discovery of the SMSF and
+subscriptions to the SMSFs discovered; and a gateway that stands alone: the SMS surfaces need no
+platform to have created anything, and their settings, metrics and contract carry neutral names.
+**Breaking** for the SMS surfaces' settings and names (below); without `NRF_API_ROOT` (chart
+`config.nrf.apiRoot`) and the SMS surfaces the gateway behaves as 0.4.1. The NATS contract
+(`sbi-ha-gateway-client` v0.4.0) adds one optional field, `smsfInstanceId`, to the serving-SMSF
+lookup's reply and to an SMS's routing; a DeliveryEvent may carry new causes: `NO_ACCESS_TOKEN`
+and `DISCOVERY_FAILED` with status `PENDING` or `FAILED`, `SMSF_NOT_FOUND` with `FAILED`.
+
+### Changed — breaking
+
+- **The SMS surfaces' settings are `SMS_*`:** `SMS_ENABLED`, `SMS_RESOLVER_FILE`,
+  `SMS_UECM_TIMEOUT` (chart `config.sms`). The former `OTA_ENABLED`, `OTA_RESOLVER_FILE` and
+  `OTA_UECM_TIMEOUT` stop the gateway at start, naming the new variable, rather than switching
+  the SMS surfaces off unnoticed; the chart refuses its former key.
+- **Delivery events go to `sbi.nsmsf.delivery.event` by default** (`SMS_DELIVERY_EVENT_SUBJECT`;
+  chart `config.sms.deliveryEventSubject`), and the stream the gateway creates is
+  `SBI_SMSF_SEND` (`SMS_STREAM`). An SMS platform that consumes the former subject sets the
+  variable to it; its stream is used whatever its name.
+- **Metrics:** `sbi_gateway_sms_uecm_lookups_total`, `sbi_gateway_sms_smsf_sends_total`,
+  `sbi_gateway_sms_delivery_events_published_total`, formerly prefixed otherwise; the alert on
+  SMS that exhausted their deliveries follows. The lookup's queue group is `sbi-gateway-sms`.
+- **The chart carries no third-party packaging metadata:** no vendor `x-` annotations in
+  `values.schema.json`, no catalog annotations in `Chart.yaml`, no SHACL bundle. The values and
+  their checks are unchanged.
+
+### Added
+
+- **The SMS stream is created when none exists.** The gateway consumes the stream that captures
+  `sbi.outbound.nsmsf.send.request`, whatever its name, and when none does creates `SMS_STREAM`:
+  a work queue on file storage with one replica (create the stream beforehand to choose
+  replicas and limits). Delivery events go through JetStream when a stream captured their
+  subject at start, as core publishes otherwise; before, each waited half a second for a stream
+  that was not there (measured).
+- **An example back end** in the client repository (`example/`, Apache-2.0), and a README
+  section that runs the gateway in front of it with Docker.
+
+- **The gateway registers with the NRF** (`NRF_API_ROOT`, `NRF_PROFILES_FILE`,
+  `NRF_HEARTBEAT_TIMER`; chart `config.nrf`).
+  - One profile per NF type it fronts, UDM and/or UDR. Each is a TS 29.510 NFProfile the operator
+    writes; the gateway adds `nfStatus`, `heartBeatTimer` and the services it serves. Every service
+    carries its API version and the full version of its 3GPP OpenAPI definition, `scheme` and
+    `oauth2Required`.
+  - The gateway registers once its ports serve and heartbeats at the NRF's interval, over HTTP/2
+    with the outbound TLS identity. It registers again when a heartbeat is answered 404, and
+    retries failures. Readiness does not depend on the NRF.
+  - The installation is one NF instance whatever its replica count. Every pod registers the same
+    profile, and a pod stopping on SIGTERM does not deregister, since the others serve on.
+  - `sbi-gateway nrf-deregister` removes the profiles. The chart runs it as a post-delete Job on
+    `helm uninstall`: it deletes them, waits a heartbeat interval and deletes again until a delete
+    finds nothing. A pod still stopping cannot leave the instance registered.
+  - The profile file is checked at start: lower-case UUID v4 instance IDs, UDM, UDR or SMS_GMSC,
+    an address, an FQDN when the SBI is https.
+  - With an NRF that requires OAuth2 on NFManagement, as free5GC's does by default: once the NRF
+    answers 401, every request carries an access token of scope `nnrf-nfm` (Nnrf_AccessToken,
+    TS 29.510 clause 5.4). Each profile has its own, asked for with its NF type and instance ID at
+    the token endpoint of the NRF's scheme and authority. A token is replaced 30 s before it
+    expires (at half its lifetime when shorter); while renewal fails, it serves until it expires.
+    A token the NRF refuses is replaced once. An NRF that asks for none is sent none.
+  - A heartbeat answered 401 while the NRF refuses the token as `invalid_client` is followed by a
+    registration too: free5GC's NRF checks the token before it looks the instance up and issues
+    tokens to registered instances alone, so it answers an instance it dropped 401, never 404.
+    On the 1st, 2nd, 4th… such refusal in a row, then every 32nd, since an NRF that knows the
+    instance and refuses it for another reason may notify its subscribers of each registration.
+  - Requests to the NRF carry `User-Agent: <NF type>-<nfInstanceId>` (TS 29.500 clause 5.2.2.2).
+  - Metrics `nrf_registered`, `nrf_requests_total` (operation `token` for access token requests),
+    `nrf_last_contact_timestamp_seconds`. Alerts: no pod holds a profile registered; a pod cannot
+    reach the NRF, where neither an access token issued nor a registration while heartbeats fail
+    counts as reaching it.
+  - Tested against Open5GS 2.7.6's NRF:
+    - two replicas registered both profiles;
+    - an AMF's discovery found the UDM;
+    - after the NRF restarted, the gateway registered again within one heartbeat;
+    - through a rolling restart the profile was never missing;
+    - the uninstall Job deregistered it.
+  - Tested against free5GC v4.3.0's NRF with OAuth on, over h2c and over TLS with mTLS:
+    - two replicas registered both profiles, obtained tokens on the first 401 and heartbeated;
+    - the NRF drops every profile when it stops; heartbeats were answered 401 and tokens refused
+      `invalid_client`, and the gateway registered the profiles again (about 100 s after the drop,
+      the gateway having been refused for minutes before it);
+    - the uninstall Job deregistered them, its last DELETE with the token it held.
+  - free5GC's NRF with OAuth on, for those who deploy it:
+    - it rewrites its TLS certificate at every start with the name `NRF` alone: reach it at the
+      host name `nrf` (`https://nrf:<port>`, a Service or ExternalName so named), or verification
+      fails (`x509: certificate is valid for NRF, not …`);
+    - it signs the certificate it checks token requests against when an instance first registers
+      and keeps it in its local certificate directory. After a crash that loses the directory but
+      not the database, or on another NRF replica, it refuses the instance tokens until it drops
+      the instance (it does when it stops) and the gateway registers it anew: keep the directory
+      on a persistent volume and run one replica.
+- **Access tokens for MT SMS.** Nsmsf_SMService MtForwardSm goes to the SMSF as an SMS-GMSC (TS
+  29.540 Table 5.2.1-1 gives the operation to the SMS-GMSC, SMS Router and IP-SM-GW), the
+  instance of an `SMS_GMSC` profile in `NRF_PROFILES_FILE` (chart `config.nrf.profiles`).
+  - The profile registers with the NRF and heartbeats as the others do, with no service: an NRF
+    may issue tokens to registered instances alone and match the requested NF type to the
+    profile's, and an SMSF's `allowedNfTypes` name the SMS-GMSC (free5GC's NRF checks all three).
+  - The Nsmsf API admits calls with and without a token, so the SMSF decides. Once an SMSF
+    answers 401, its calls carry a token of scope `nsmsf-sms` for target NF type SMSF, asked for
+    with the profile's NF type and instance ID; a 401 is answered with a fresh token, once. The
+    cache and renewal are NFManagement's.
+  - Tokens go over https alone. The SMSF's address comes from the NATS message, and a token
+    names the producer's NF type, not its instance: any SMSF would accept one seen in
+    cleartext. An SMSF reached over http that answers 401 fails the SMS (`HTTP_401`).
+  - An SMS the SMSF asks a token for, when the NRF gives none, is `PENDING` with cause
+    `NO_ACCESS_TOKEN` and redelivered, as a transient failure is. A second 401 is the SMSF's
+    answer: `FAILED`, `HTTP_401`.
+  - The profile needs `SMS_ENABLED` (chart `config.sms.enabled`) and no `service`; it is not in
+    `OAUTH_AUDIENCE`, since no token names it. The gateway refuses to start otherwise, and the
+    chart refuses to render.
+  - Without the profile MT SMS goes as before, without a token.
+  - Notifications carry no token: their callbacks state no security in the 3GPP OpenAPI
+    definitions.
+- **Discovery of the SMSF.** An SMS may name its SMSF by NF instance ID
+  (`routing.smsfInstanceId`), as the SMSF registered it with the UDM (TS 29.503
+  SmsfRegistration carries the instance ID, not an address). With an `SMS_GMSC` profile the
+  gateway finds that SMSF's `nsmsf-sms` v2 service with the NRF's Nnrf_NFDiscovery (free5GC's
+  client), as the SMS-GMSC, and sends the SMS there; `smsfFqdn` is then not used.
+  - The address is built as TS 29.510 clause 6.1.6.2.3 says: over https the service's FQDN,
+    else the profile's; over http an address of the service's `ipEndPoints` first. Of the
+    registered services with v2 in their URIs, one with the lowest `priority`, weighted by
+    `capacity`.
+  - The access token is asked for that SMSF alone (`targetNfInstanceId`): free5GC's NRF then
+    names it as the token's `aud` (measured; without it `aud` is empty).
+  - A result serves for the NRF's `validityPeriod`, and after it while the NRF does not answer
+    (no answer, 5xx, 429, or a 401 without a token to send). An answer without the SMSF forgets
+    it. The discovery API admits requests with and without a token of scope `nnrf-disc`: once
+    the NRF answers 401, they carry the SMS-GMSC's.
+  - The SMS is `FAILED`, cause `SMSF_NOT_FOUND`, when the NRF knows no such SMSF offering
+    `nsmsf-sms` v2; `PENDING`, `DISCOVERY_FAILED`, when the NRF cannot be asked; `FAILED`,
+    `DISCOVERY_FAILED`, when it refuses the search. Without an `SMS_GMSC` profile an instance ID
+    alone is `INVALID_ROUTING`, and the SMS goes to `smsfFqdn` when it has one.
+  - `SMS_RESOLVER_FILE` entries may carry `SmsfInstanceId`, with or instead of `SmsfFqdn`; the
+    lookup's reply carries it.
+  - Metrics: `nrf_requests_total{operation="discover"}`. Alert `SbiGatewayNRFDiscoveryFailing`:
+    a pod's discoveries fail and none succeeds for 10 minutes. `SbiGatewayNRFUnreachable` no
+    longer counts a failed discovery: an NRF may refuse a search it answers.
+  - Measured on free5GC v4.3.0's NRF (OAuth on) with the gateway's discovery client: the first
+    search is answered 401, the token request 200, the search with the token 400 `Loss mandatory
+    parameter`. Its discovery admits 21 requester NF types, and SMS_GMSC is not one of them; the
+    same search as a UDM finds the SMSF (`https://smsf.example:8443`). With free5GC's NRF the SMS
+    therefore fails `DISCOVERY_FAILED`. On Open5GS 2.7.6's NRF the search as SMS_GMSC finds the
+    SMSF; an unknown instance is answered 200 with no instance (and no `validityPeriod`).
+- **Subscriptions to the SMSFs discovered** (`NRF_NOTIFICATION_API_ROOT`; chart
+  `config.nrf.notificationApiRoot`). Set to the `{apiRoot}` the NRF reaches the SBI port at,
+  each pod subscribes, as the SMS-GMSC, to every SMSF its discovery found (NFStatusSubscribe,
+  TS 29.510 clause 5.2.2.5, free5GC's NFManagement client): to that instance's deregistration
+  and profile changes. A deregistration notified forgets the SMSF, a profile change ends its
+  result; the next SMS asks the NRF again instead of waiting for the `validityPeriod`.
+  - A notification only makes the gateway ask the NRF: the profile it may carry is not used.
+    Its sender is not authenticated (the callback's OpenAPI states no security; free5GC's NRF
+    sends a token for the NF type, with no scope, Open5GS's none), so the callback path
+    `/nrf-notify/v1/{replica}/{key}` needs no access token; the 128-bit random key in it is what
+    a sender must know.
+  - The NRF reaches whichever pod the address leads to. A pod hands a notification for another
+    pod's subscription to it over NATS (`sbi.internal.nrf.notify.<replica>`, core
+    request/reply: the gateway's NATS user publishes and subscribes there); one for a pod no
+    longer running, or a key no pod has, is answered 404 (clause 5.2.2.6.2).
+  - An hour is asked for; a subscription is renewed at half the validity time granted, created
+    anew when the NRF answers 404, and retried after a failure at 1 s, 2 s, … up to 5 min. A pod
+    removes its subscriptions when it stops (within 5 s), and a subscription when its SMSF is
+    forgotten.
+  - Off while the setting is empty. Set without an `SMS_GMSC` profile, the gateway refuses to
+    start: it subscribes as the SMS-GMSC.
+  - Metrics: `nrf_requests_total{operation="subscribe"|"subscription_update"|"unsubscribe"}`,
+    `nrf_notifications_total{event,result}`. Alert `SbiGatewayNRFSubscriptionFailing`: a pod's
+    subscriptions and renewals fail and none succeeds for 10 minutes. `SbiGatewayNRFUnreachable`
+    no longer counts subscription requests.
+  - Measured with two subscribers behind one address, the second handed its notifications over
+    NATS:
+    - free5GC v4.3.0's NRF (OAuth on), discovering as a UDM, since it refuses the search as
+      SMS_GMSC: subscriptions created (401, then 201 with a token); notifications over h2c, with
+      a Bearer token. A changed profile (PUT) was notified, with the profile, and both
+      subscribers found the new address at once. A deregistration was notified, and both
+      removed their subscriptions. Stopping removed the rest: none was left at the NRF.
+      free5GC's NRF keeps the validity time asked for, answers no `Location`, and answers a
+      renewal or removal of a subscription it does not have 204, not 404.
+    - Open5GS 2.7.6's NRF, as SMS_GMSC: a validity of 24 h granted; a renewal of an unknown
+      subscription answered 404. A deregistration was notified, without token; the removals on
+      stop arrived. A changed profile was not notified, neither by PUT (a new port, which it
+      stored) nor by PATCH (it refused the path `/fqdn` and answered 204): with Open5GS a
+      profile change still waits for the `validityPeriod` (30 s by default).
+- **`OAUTH_AUDIENCE` takes a comma-separated list**, any of which matches. With NRF registration
+  and OAuth on it must list each profile's `nfInstanceId` but the SMS-GMSC's, since a token the
+  NRF issues for a profile names it. The gateway refuses to start otherwise, and the chart refuses to render.
+
+### Dependencies
+
+- **`github.com/free5gc/openapi` v1.3.0** (Apache-2.0): its generated Nnrf_AccessToken client
+  requests the tokens, its Nnrf_NFDiscovery client the SMSF's profile, and its NFManagement
+  client the subscriptions. Where free5GC implements an SBI client, the gateway uses it rather than its
+  own. The gateway's NFManagement client stays its own: free5GC's typed NFProfile drops a
+  `priority`, `capacity` or `load` of 0 (0 is the highest priority) and vendor-specific
+  attributes, and its client loses the status of a 404 without a ProblemDetails body, which the
+  re-registration relies on.
+- **`golang.org/x/net` v0.60.0**, which free5GC's client brings in: v0.58.0 has GO-2026-6603,
+  GO-2026-6610, GO-2026-6611, GO-2026-6612 and GO-2026-6617 (HTTP/2).
+
 ## [0.4.1] — 2026-10-21
 
 The four findings of 0.4.0's release, and Go 1.26.10 for a crypto/x509 vulnerability published
@@ -24,11 +223,11 @@ where 0.4.0 wrote `anonymous`. Chart 0.4.1 deploys 0.4.1.
   case-insensitively and the ID is written in lower case. A certificate carrying only the old form
   is now audited as `anonymous`. The ID is used for that audit field alone; no check changes.
 - **`/health/ready` answers `"reasons":[]` when ready,** where 0.4.0 wrote `null`.
-- **Chart: Arinna can tune 0.4.0's values.** `config.admin.auth` and `config.admin.tls` are
-  high-risk, approval-gated changes like the other protections; `config.admin.tokenSecret` is a
-  Secret reference; `metrics.serviceMonitor` and `metrics.prometheusRule` (enabled, interval,
-  thresholds) are low-risk. Chart 0.4.0 carried no `x-arinna` on them, so Arinna could install
-  only the defaults.
+- **Chart: the schema's tuning annotations cover 0.4.0's values.** `config.admin.auth` and
+  `config.admin.tls` are high-risk, approval-gated changes like the other protections;
+  `config.admin.tokenSecret` is a Secret reference; `metrics.serviceMonitor` and
+  `metrics.prometheusRule` (enabled, interval, thresholds) are low-risk. Chart 0.4.0 left them
+  unannotated.
 - **Chart: the NetworkPolicy's description no longer says the admin port has no
   authentication;** it has its token and TLS since 0.4.0.
 
@@ -186,7 +385,7 @@ the trial install switches off what it lacks.
   - `config.mtls.outbound{Cert,Key,CA}File` reach the gateway; 0.2.x defined but never rendered
     them.
   - `extraVolumes` and `extraVolumeMounts` mount the files the gateway reads by path: outbound
-    TLS, `config.oauth.jwksFile`, `config.ota.resolverFile`.
+    TLS, `config.oauth.jwksFile`, the SMS resolver file.
   - A NetworkPolicy lets the unauthenticated admin port be reached only from the release's
     namespace and `networkPolicy.adminFrom`; the SBI port from `networkPolicy.sbiFrom`, or
     anywhere.
@@ -279,7 +478,8 @@ the trial install switches off what it lacks.
   deliveries, 0.2.x's last `DeliveryEvent` was `PENDING` and nothing followed; the message stayed in
   the work queue. The last delivery's transient failure is now `FAILED` with cause
   `RETRIES_EXHAUSTED`, the transient cause in `BearerMeta` `lastCause`, and the message is
-  acknowledged. Metric `sbi_gateway_ota_smsf_sends_total{result="retries_exhausted"}`.
+  acknowledged. Metric: the SMS sends' `result="retries_exhausted"` (`sbi_gateway_sms_smsf_sends_total` since
+  0.5.0).
 - **Every operation of the APIs served.** The routes come from the 3GPP Rel-17 OpenAPI definitions:
   249 operations of Nudm_UEAU, UECM, SDM, EE, PP, MT, ReportSMDeliveryStatus and Nudr subscription
   data. Nudm_ReportSMDeliveryStatus is new: an SMS-GMSC reports the outcome of an MT SMS to the UDM
@@ -394,7 +594,7 @@ other values are those of 0.2.0.
   With `nats.deploy: false` an empty `config.nats.url` refuses to render.
 - **Breaking:** `config.nats.url` defaults to empty; it was `nats://nats-cluster:4222`, an address
   that does not exist in most clusters. Set it to the NATS your applications use.
-- `config.ota.enabled` with the bundled NATS refuses to render: the SMS stream is on the
+- Enabling the SMS surfaces with the bundled NATS refuses to render: the SMS stream is on the
   applications' NATS.
 - The pods meet the Kubernetes `restricted` Pod Security Standard: seccomp `RuntimeDefault` on the
   gateway pod. The `smoke` NATS of 0.1.0 also carried the gateway's selector labels, so the

@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	sbiclient "github.com/3eAI-Labs/sbi-ha-gateway-client"
 )
 
 // Config holds all application configuration
@@ -89,13 +92,24 @@ type Config struct {
 	// kill switch for development environments where setting up an NRF is
 	// not worth the friction.
 	OAuthDisabled           bool
-	OAuthAudience           string        // expected `aud` claim — this NF's instance ID
+	OAuthAudience           string        // expected `aud` claim — this NF's instance ID(s), comma-separated
 	OAuthNRFJWKSURL         string        // NRF's JWKS endpoint
 	OAuthJWKSFile           string        // static JWKS file (CI/airgap fallback)
 	OAuthJWKSRefresh        time.Duration // JWKS refresh interval, default 5m
 	OAuthClockSkew          time.Duration // ± exp/nbf tolerance, default 30s
 	OAuthResultCacheTTL     time.Duration // per-token positive cache, default 60s
 	OAuthRequireCertBinding bool          // RFC 8705 — reject tokens without cnf when true (default false)
+
+	// Registration with the NRF (TS 29.510 Nnrf_NFManagement). NRFAPIRoot and NRFProfilesFile
+	// together, or neither: without them the gateway does not register. NRFHeartbeatTimer is
+	// the heartbeat interval proposed at registration (whole seconds); 0 leaves it to the NRF.
+	NRFAPIRoot        string
+	NRFProfilesFile   string
+	NRFHeartbeatTimer time.Duration
+	// NRFNotificationAPIRoot is the {apiRoot} the NRF reaches the SBI port at: the gateway
+	// subscribes to the SMSFs it discovers, with callback URIs under it. Empty: no
+	// subscription; a discovered SMSF serves for the validityPeriod alone.
+	NRFNotificationAPIRoot string
 
 	// Outbound delivery profile. "sbi_direct" routes via
 	// HTTP/2 SBI to the URI in the notification payload (with HA failover
@@ -108,12 +122,15 @@ type Config struct {
 	OutboundAllowAny            bool
 	OutboundProfile             string
 
-	// SMS (OTA) surfaces: serving-SMSF lookup and Nsmsf SendSMS. Disabled by
-	// default so existing deployments don't open the UECM/SMSF subjects
-	// without operator opt-in.
-	OTAEnabled      bool
-	OTAResolverFile string        // optional MSISDN→{Supi,SmsfFqdn,SmsfPlmnId} JSON
-	OTAUecmTimeout  time.Duration // probe budget for the UECM reply; default 3s (fail-fast for OTA Diameter fallback)
+	// SMS surfaces: serving-SMSF lookup and Nsmsf MtForwardSm. Off by default, so that a
+	// deployment does not consume the UECM and SMSF subjects without the operator opting in.
+	// SMSStream is the JetStream stream that captures the SMS to send (created, with one
+	// replica, when it does not exist); SMSDeliveryEventSubject where each SMS's result goes.
+	SMSEnabled              bool
+	SMSResolverFile         string        // optional MSISDN→{Supi,SmsfFqdn,SmsfInstanceId,SmsfPlmnId} JSON
+	SMSUecmTimeout          time.Duration // budget for the UECM reply; default 3s: a lookup is a probe, fail fast
+	SMSStream               string
+	SMSDeliveryEventSubject string
 
 	// Audit of state-changing operations. The disable flag is the kill
 	// switch for development; when audit is on, events go to the NATS
@@ -194,21 +211,55 @@ func Load() (*Config, error) {
 		OAuthResultCacheTTL:     l.duration("OAUTH_RESULT_CACHE_TTL", 60*time.Second),
 		OAuthRequireCertBinding: l.boolean("OAUTH_REQUIRE_CERT_BINDING", false),
 
+		// NRF registration (default: none).
+		NRFAPIRoot:             l.str("NRF_API_ROOT", ""),
+		NRFProfilesFile:        l.str("NRF_PROFILES_FILE", ""),
+		NRFHeartbeatTimer:      l.duration("NRF_HEARTBEAT_TIMER", 0),
+		NRFNotificationAPIRoot: l.str("NRF_NOTIFICATION_API_ROOT", ""),
+
 		// Outbound profile (default: sbi_direct).
 		OutboundProfile:             l.str("OUTBOUND_PROFILE", "sbi_direct"),
 		OutboundAllowedDestinations: l.str("OUTBOUND_ALLOWED_DESTINATIONS", ""),
 		OutboundAllowAny:            l.boolean("OUTBOUND_ALLOW_ANY", false),
 
-		// SMS (OTA) surfaces (default: off until operator opts in).
-		OTAEnabled:      l.boolean("OTA_ENABLED", false),
-		OTAResolverFile: l.str("OTA_RESOLVER_FILE", ""),
-		OTAUecmTimeout:  l.duration("OTA_UECM_TIMEOUT", 3*time.Second),
+		// SMS surfaces (default: off until the operator opts in).
+		SMSEnabled:              l.boolean("SMS_ENABLED", false),
+		SMSResolverFile:         l.str("SMS_RESOLVER_FILE", ""),
+		SMSUecmTimeout:          l.duration("SMS_UECM_TIMEOUT", 3*time.Second),
+		SMSStream:               l.name("SMS_STREAM", sbiclient.StreamSmsfSend, streamName, "a JetStream stream name"),
+		SMSDeliveryEventSubject: l.name("SMS_DELIVERY_EVENT_SUBJECT", sbiclient.SubjectDeliveryEvent, subjectName, "a NATS subject without wildcards"),
 
 		// Audit (default: enabled — slog fallback if NATS publisher absent).
 		AuditDisabled:    l.boolean("AUDIT_DISABLED", false),
 		AuditNATSSubject: l.str("AUDIT_NATS_SUBJECT", "audit.events"),
 	}
+	// Renamed in 0.5.0: an installation still setting the old names would lose its SMS
+	// surfaces without a word.
+	for old, now := range map[string]string{
+		"OTA_ENABLED": "SMS_ENABLED", "OTA_RESOLVER_FILE": "SMS_RESOLVER_FILE", "OTA_UECM_TIMEOUT": "SMS_UECM_TIMEOUT",
+	} {
+		if os.Getenv(old) != "" {
+			l.errs = append(l.errs, fmt.Errorf("%s was renamed %s", old, now))
+		}
+	}
 	return cfg, errors.Join(l.errs...)
+}
+
+var (
+	// streamName: a JetStream stream name has no whitespace, ".", "*", ">", "/" or "\".
+	streamName = regexp.MustCompile(`^[^\s.*>/\\]{1,255}$`)
+	// subjectName: dot-separated tokens, no wildcard.
+	subjectName = regexp.MustCompile(`^[^\s.*>]+(\.[^\s.*>]+)*$`)
+)
+
+// name returns the variable, or def when it is empty; a value the pattern does not match is
+// an error.
+func (l *loader) name(key, def string, pattern *regexp.Regexp, want string) string {
+	val := l.str(key, def)
+	if !pattern.MatchString(val) {
+		l.invalid(key, val, want)
+	}
+	return val
 }
 
 // loader reads environment variables and records each value that does not parse.

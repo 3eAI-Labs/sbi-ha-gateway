@@ -208,42 +208,93 @@ var (
 		},
 	)
 
-	// --- SMS (OTA) surfaces --------------------------------------------
+	// --- SMS surfaces ----------------------------------------------------
 
-	// OtaUecmLookups counts Nudm_UECM probe outcomes from OTA. The result
-	// label is bounded: ok | not_found | malformed | resolver_error.
-	// "not_found" is the *expected* default until UDM client lands —
-	// triggers OTA's graceful Diameter fallback, not an alert.
-	OtaUecmLookups = promauto.NewCounterVec(
+	// SMSUecmLookups counts the serving-SMSF lookups an SMS platform asks. The result
+	// label is bounded: ok | not_found | malformed | resolver_error. "not_found" is
+	// expected while no resolver file lists the subscriber: the platform falls back to
+	// Diameter or MAP, which is no reason to alert.
+	SMSUecmLookups = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "sbi_gateway",
-			Name:      "ota_uecm_lookups_total",
+			Name:      "sms_uecm_lookups_total",
 			Help:      "Serving-SMSF (Nudm_UECM) lookup outcomes",
 		},
 		[]string{"result"},
 	)
 
-	// OtaSmsfSends counts Nsmsf_SMService SendSMS attempts dispatched via
+	// SMSSmsfSends counts Nsmsf_SMService MtForwardSm attempts dispatched via
 	// the JetStream consumer. result: delivered | pending | failed | retries_exhausted |
 	// client_error | bypassed | not_implemented.
-	OtaSmsfSends = promauto.NewCounterVec(
+	SMSSmsfSends = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "sbi_gateway",
-			Name:      "ota_smsf_sends_total",
-			Help:      "Nsmsf_SMService SendSMS dispatch outcomes",
+			Name:      "sms_smsf_sends_total",
+			Help:      "Nsmsf_SMService MtForwardSm dispatch outcomes",
 		},
 		[]string{"result"},
 	)
 
-	// OtaDeliveryEventsPublished counts ota.delivery.event publications by
+	// SMSDeliveryEventsPublished counts DeliveryEvent publications by
 	// the unified status enum (DELIVERED / FAILED / PENDING).
-	OtaDeliveryEventsPublished = promauto.NewCounterVec(
+	SMSDeliveryEventsPublished = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "sbi_gateway",
-			Name:      "ota_delivery_events_published_total",
-			Help:      "Delivery events published to ota.delivery.event by status",
+			Name:      "sms_delivery_events_published_total",
+			Help:      "SMS delivery events published by status",
 		},
 		[]string{"status"},
+	)
+
+	// --- NRF registration (TS 29.510 Nnrf_NFManagement) -------------------
+
+	// NRFRequests counts the gateway's requests to the NRF by operation (register,
+	// heartbeat, retrieve, deregister; token, an access token request; discover, an
+	// NFDiscovery search; subscribe, subscription_update, unsubscribe, NFStatusSubscribe's)
+	// and result: the HTTP status, or "error" when none came back.
+	NRFRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "sbi_gateway",
+			Name:      "nrf_requests_total",
+			Help:      "Requests to the NRF (NFManagement, access tokens, NFDiscovery, NFStatusSubscribe) by operation and result (HTTP status, or error without one)",
+		},
+		[]string{"nf_type", "operation", "result"},
+	)
+
+	// NRFNotifications counts the NRF's notifications to the gateway's subscriptions
+	// (NFStatusNotify) by event (NF_DEREGISTERED, NF_PROFILE_CHANGED, NF_REGISTERED, other;
+	// empty when the notification could not be read) and result: accepted,
+	// unknown_subscription (answered 404), malformed, relay_failed (the replica that
+	// subscribed could not be reached over NATS).
+	NRFNotifications = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "sbi_gateway",
+			Name:      "nrf_notifications_total",
+			Help:      "NRF notifications to the gateway's subscriptions by event and result",
+		},
+		[]string{"event", "result"},
+	)
+
+	// NRFRegistered is 1 per NF profile while this pod holds it registered: after the
+	// NRF accepted its registration and until it answers that it does not know the instance.
+	NRFRegistered = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "sbi_gateway",
+			Name:      "nrf_registered",
+			Help:      "1 while the NF profile is registered with the NRF as far as this pod knows",
+		},
+		[]string{"nf_type"},
+	)
+
+	// NRFLastContact is when the NRF last accepted a registration or heartbeat of the NF
+	// profile from this pod (Unix seconds).
+	NRFLastContact = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "sbi_gateway",
+			Name:      "nrf_last_contact_timestamp_seconds",
+			Help:      "When the NRF last accepted this pod's registration or heartbeat of the NF profile",
+		},
+		[]string{"nf_type"},
 	)
 
 	// --- Audit -----------------------------------------------------------
@@ -364,19 +415,19 @@ func RecordOutboundPosition(position int) {
 	OutboundEndpointPosition.Observe(float64(position))
 }
 
-// RecordOtaUecmLookup records the outcome of one Nudm_UECM probe from OTA.
-func RecordOtaUecmLookup(result string) {
-	OtaUecmLookups.WithLabelValues(result).Inc()
+// RecordSMSUecmLookup records the outcome of one serving-SMSF lookup.
+func RecordSMSUecmLookup(result string) {
+	SMSUecmLookups.WithLabelValues(result).Inc()
 }
 
-// RecordOtaSmsfSend records the outcome of one Nsmsf_SMService SendSMS dispatch.
-func RecordOtaSmsfSend(result string) {
-	OtaSmsfSends.WithLabelValues(result).Inc()
+// RecordSMSSmsfSend records the outcome of one Nsmsf_SMService SendSMS dispatch.
+func RecordSMSSmsfSend(result string) {
+	SMSSmsfSends.WithLabelValues(result).Inc()
 }
 
-// RecordOtaDeliveryEvent records a publish to ota.delivery.event.
-func RecordOtaDeliveryEvent(status string) {
-	OtaDeliveryEventsPublished.WithLabelValues(status).Inc()
+// RecordSMSDeliveryEvent records a DeliveryEvent publication.
+func RecordSMSDeliveryEvent(status string) {
+	SMSDeliveryEventsPublished.WithLabelValues(status).Inc()
 }
 
 // RecordAuditEvent records the outcome of an audit.Log call.
@@ -392,4 +443,33 @@ func SetSecurityProtection(protection string, on bool) {
 	} else {
 		SecurityProtection.WithLabelValues(protection).Set(0)
 	}
+}
+
+// RecordNRFRequest counts one request to the NRF; result is the HTTP status or "error".
+// A success also stamps the last contact, but for a deregistration or an access token.
+func RecordNRFRequest(nfType, operation, result string, ok bool) {
+	NRFRequests.WithLabelValues(nfType, operation, result).Inc()
+	if ok && operation != "deregister" && operation != "token" {
+		NRFLastContact.WithLabelValues(nfType).SetToCurrentTime()
+	}
+}
+
+// RecordNRFNotification counts one NRF notification; an event the NRF API does not define
+// counts as other.
+func RecordNRFNotification(event, result string) {
+	switch event {
+	case "", "NF_DEREGISTERED", "NF_PROFILE_CHANGED", "NF_REGISTERED":
+	default:
+		event = "other"
+	}
+	NRFNotifications.WithLabelValues(event, result).Inc()
+}
+
+// SetNRFRegistered records whether the NF profile is registered as far as this pod knows.
+func SetNRFRegistered(nfType string, registered bool) {
+	v := 0.0
+	if registered {
+		v = 1
+	}
+	NRFRegistered.WithLabelValues(nfType).Set(v)
 }

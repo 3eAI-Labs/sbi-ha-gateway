@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/handlers/uecm"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/metrics"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/nats"
+	"github.com/3eAI-Labs/sbi-ha-gateway/internal/nrf"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/oauth"
 	cgaudit "github.com/3eAI-Labs/sbi-ha-gateway/internal/platform/audit"
 	"github.com/3eAI-Labs/sbi-ha-gateway/internal/platform/logger"
@@ -39,7 +41,9 @@ func main() {
 	}
 }
 
-// Run starts the application with OS signal handling for graceful shutdown
+// Run starts the application with OS signal handling for graceful shutdown. With the
+// argument nrf-deregister it removes the NF profiles from the NRF instead (the chart's
+// post-delete hook), and exits.
 func Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -52,7 +56,14 @@ func Run() error {
 		cancel()
 	}()
 
-	return RunWithContext(ctx)
+	switch args := os.Args[1:]; {
+	case len(args) == 0:
+		return RunWithContext(ctx)
+	case len(args) == 1 && args[0] == "nrf-deregister":
+		return deregister(ctx)
+	default:
+		return fmt.Errorf("arguments %q: want none, or nrf-deregister", args)
+	}
 }
 
 // RunWithContext starts the application with the given context for shutdown control
@@ -165,13 +176,16 @@ func RunWithContext(ctx context.Context) error {
 	}
 	reportSecurity(log, cfg)
 
-	r := server.NewRouter(server.RouterConfig{
-		SBI:            sbiH,
-		OAuthValidator: oauthValidator,
-		RateLimitRPS:   cfg.RateLimitRPS,
-		RateLimitBurst: cfg.RateLimitBurst,
-		Logger:         log,
-	})
+	// 4.0.1 The NF profiles to register with the NRF, checked before anything connects.
+	nrfProfiles, nrfClient, err := buildNRF(cfg, true)
+	if err != nil {
+		return err
+	}
+	smsGMSC := slices.IndexFunc(nrfProfiles, func(p nrf.Profile) bool { return p.Type == nrf.SMSGMSC })
+	if smsGMSC >= 0 && !cfg.SMSEnabled {
+		return errors.New("NRF_PROFILES_FILE has an SMS_GMSC profile and SMS_ENABLED is off: " +
+			"the gateway would register an SMS-GMSC that sends no SMS")
+	}
 
 	// 4.1 Build outbound HTTP/2 client. mTLS config is fatal-on-partial
 	// (cert without key, etc.) — see sbi.buildOutboundTLS.
@@ -190,6 +204,54 @@ func RunWithContext(ctx context.Context) error {
 		log.Error("Outbound HTTP client init failed", slog.Any("error", err))
 		return err
 	}
+	// MtForwardSm goes as the SMS-GMSC: with its access tokens, once an SMSF asks for one, to
+	// the SMSF its discovery finds when the SMS names the SMSF by instance ID.
+	var smsfDiscovery nats.Discovery
+	var smsfWatcher *nrf.Watcher
+	var nrfNotifications *nrf.Notifications
+	if smsGMSC >= 0 {
+		amfClient.Tokens = nrfClient.TokenSource(nrfProfiles[smsGMSC])
+		discovery := nrfClient.Discovery(nrfProfiles[smsGMSC])
+		smsfDiscovery = discovery
+		log.Info("MT SMS goes as the SMS_GMSC profile: SMSFs named by instance ID are discovered, "+
+			"and its access tokens go when an SMSF asks for one",
+			slog.String("nf_instance_id", nrfProfiles[smsGMSC].InstanceID))
+		// The SMSFs discovered are subscribed to, so that their deregistration or profile
+		// change ends the cached result: the NRF notifies at NRF_NOTIFICATION_API_ROOT.
+		if cfg.NRFNotificationAPIRoot != "" {
+			if smsfWatcher, err = nrf.NewWatcher(discovery, cfg.NRFNotificationAPIRoot, cfg.TLSEnabled(), log); err != nil {
+				return err
+			}
+			if nrfNotifications, err = nrf.NewNotifications(smsfWatcher, nc.GetConn(), log); err != nil {
+				return fmt.Errorf("NRF notifications: %w", err)
+			}
+			defer nrfNotifications.Close()
+			log.Info("The SMSFs discovered are subscribed to at the NRF (NFStatusSubscribe)",
+				slog.String("notification_api_root", cfg.NRFNotificationAPIRoot),
+				slog.String("replica", smsfWatcher.Replica()))
+		} else {
+			log.Info("The SMSFs discovered are not subscribed to: NRF_NOTIFICATION_API_ROOT is empty; " +
+				"a discovered SMSF serves for the validityPeriod the NRF answered with")
+		}
+	} else if cfg.SMSEnabled {
+		log.Info("MT SMS goes to the SMSF FQDN of each message, without access token: " +
+			"NRF_PROFILES_FILE has no SMS_GMSC profile")
+	}
+	if cfg.NRFNotificationAPIRoot != "" && smsGMSC < 0 {
+		return errors.New("NRF_NOTIFICATION_API_ROOT is set and NRF_PROFILES_FILE has no SMS_GMSC profile: " +
+			"the gateway subscribes to the SMSFs it discovers as the SMS_GMSC, and would subscribe to none")
+	}
+	routerCfg := server.RouterConfig{
+		SBI:            sbiH,
+		OAuthValidator: oauthValidator,
+		RateLimitRPS:   cfg.RateLimitRPS,
+		RateLimitBurst: cfg.RateLimitBurst,
+		Logger:         log,
+	}
+	if nrfNotifications != nil {
+		routerCfg.NRFNotifications = nrfNotifications.Route
+	}
+	r := server.NewRouter(routerCfg)
 	if cfg.MTLSOutboundCertFile != "" {
 		log.Info("Outbound mTLS enabled",
 			slog.String("cert", cfg.MTLSOutboundCertFile),
@@ -218,34 +280,37 @@ func RunWithContext(ctx context.Context) error {
 	}
 	log.Info("NATS Subscriber started (Listening for Callbacks with HA failover)")
 
-	// 4.4 Start the SMS (OTA) subscriber: serving-SMSF lookup and SendSMS. Opt-in via
-	// OTA_ENABLED — when off, the UECM / SMSF subjects are not consumed
-	// and OTA's probe budget naturally times out (the documented graceful
-	// fallback to Diameter / MAP).
-	var otaSub *nats.OTASubscriber
-	if cfg.OTAEnabled {
-		resolver, err := uecm.NewFromFile(cfg.OTAResolverFile)
+	// 4.4 Start the SMS subscriber: serving-SMSF lookup and MtForwardSm. Opt-in via
+	// SMS_ENABLED — when off, the UECM and SMSF subjects are not consumed, and an SMS
+	// platform's lookup times out (its fallback to Diameter or MAP).
+	var smsSub *nats.SMSSubscriber
+	if cfg.SMSEnabled {
+		resolver, err := uecm.NewFromFile(cfg.SMSResolverFile)
 		if err != nil {
-			log.Error("OTA resolver init failed", slog.Any("error", err))
+			log.Error("SMS resolver init failed", slog.Any("error", err))
 			return err
 		}
 		js, err := nc.JetStream()
 		if err != nil {
-			log.Error("OTA JetStream init failed", slog.Any("error", err))
+			log.Error("SMS JetStream init failed", slog.Any("error", err))
 			return err
 		}
-		otaSub = nats.NewOTASubscriber(nc.GetConn(), js, log, nats.OTAConfig{
+		smsSub = nats.NewSMSSubscriber(nc.GetConn(), js, log, nats.SMSConfig{
 			Resolver:    resolver,
 			Outbound:    outClient,
-			UecmTimeout: cfg.OTAUecmTimeout,
+			Discovery:   smsfDiscovery,
+			UecmTimeout: cfg.SMSUecmTimeout,
+			Stream:      cfg.SMSStream,
+			// The delivery events' subject.
+			DeliveryEventSubject: cfg.SMSDeliveryEventSubject,
 		})
-		if err := otaSub.Start(ctx); err != nil {
-			log.Error("OTA subscriber start failed", slog.Any("error", err))
+		if err := smsSub.Start(ctx); err != nil {
+			log.Error("SMS subscriber start failed", slog.Any("error", err))
 			return err
 		}
-		log.Info("OTA subscriber started",
-			slog.String("resolver_file", cfg.OTAResolverFile),
-			slog.Duration("uecm_timeout", cfg.OTAUecmTimeout),
+		log.Info("SMS surfaces started",
+			slog.String("resolver_file", cfg.SMSResolverFile),
+			slog.Duration("uecm_timeout", cfg.SMSUecmTimeout),
 		)
 	}
 
@@ -322,8 +387,26 @@ func RunWithContext(ctx context.Context) error {
 		failed("SBI server", srv.Serve(sbiLn))
 	}()
 
+	// 6.1 Register with the NRF once both ports serve; heartbeat until SIGTERM. A pod does
+	//     not deregister: the installation is one NF instance, and its other pods serve on.
+	var registering sync.WaitGroup
+	if nrfProfiles != nil {
+		agent := &nrf.Agent{Client: nrfClient, Profiles: nrfProfiles, Log: log}
+		registering.Go(func() { agent.Run(serveCtx) })
+		if smsfWatcher != nil {
+			// Stops with the heartbeats, removing the pod's subscriptions: its callback URIs
+			// die with it.
+			registering.Go(func() { smsfWatcher.Run(serveCtx) })
+		}
+		for _, p := range nrfProfiles {
+			log.Info("Registering with the NRF", slog.String("nf_type", p.Type),
+				slog.String("nf_instance_id", p.InstanceID), slog.String("nrf", cfg.NRFAPIRoot))
+		}
+	}
+
 	// 7. Wait for the shutdown signal, or for a server to fail.
 	<-serveCtx.Done()
+	registering.Wait() // heartbeats stop at once; the subscriptions go within 5 s
 
 	if serveErr == nil {
 		// A terminating pod leaves the Service's endpoints, but kube-proxy and any balancer
@@ -343,8 +426,8 @@ func RunWithContext(ctx context.Context) error {
 	var sbiErr error
 	stopping.Go(func() { sbiErr = srv.Shutdown(shutdownCtx) })
 	stopping.Go(func() { _ = sub.Stop(shutdownCtx) }) // logs its own outcome
-	if otaSub != nil {
-		stopping.Go(func() { _ = otaSub.Stop(shutdownCtx) })
+	if smsSub != nil {
+		stopping.Go(func() { _ = smsSub.Stop(shutdownCtx) })
 	}
 	stopping.Wait()
 
@@ -468,4 +551,81 @@ func buildOAuthValidator(ctx context.Context, cfg *config.Config, log *slog.Logg
 		ResultCacheTTL:     cfg.OAuthResultCacheTTL,
 		RequireCertBinding: cfg.OAuthRequireCertBinding,
 	}, log)
+}
+
+// buildNRF reads the NF profiles and builds the NRF client; (nil, nil, nil) when the gateway
+// does not register (NRF_API_ROOT and NRF_PROFILES_FILE unset). A token the NRF issues for a
+// profile names its instance ID as aud, so for a gateway that serves (audience) with OAuth on,
+// each must be in OAUTH_AUDIENCE: each but the SMS-GMSC's, which serves nothing.
+func buildNRF(cfg *config.Config, audience bool) ([]nrf.Profile, *nrf.Client, error) {
+	switch {
+	case cfg.NRFAPIRoot == "" && cfg.NRFProfilesFile == "":
+		return nil, nil, nil
+	case cfg.NRFAPIRoot == "" || cfg.NRFProfilesFile == "":
+		return nil, nil, errors.New("NRF registration needs both NRF_API_ROOT and NRF_PROFILES_FILE")
+	}
+	profiles, err := nrf.LoadFile(cfg.NRFProfilesFile, nrf.Options{
+		TLS:       cfg.TLSEnabled(),
+		OAuth:     !cfg.OAuthDisabled,
+		Heartbeat: cfg.NRFHeartbeatTimer,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if audience && !cfg.OAuthDisabled {
+		audiences := oauth.SplitAudience(cfg.OAuthAudience)
+		for _, p := range profiles {
+			if !p.Consumer && !slices.Contains(audiences, p.InstanceID) {
+				return nil, nil, fmt.Errorf("OAUTH_AUDIENCE does not name the %s profile's nfInstanceId %s: "+
+					"tokens the NRF issues for it would be refused", p.Type, p.InstanceID)
+			}
+		}
+	}
+	client, err := nrfHTTPClient(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	c, err := nrf.NewClient(cfg.NRFAPIRoot, client)
+	if err != nil {
+		return nil, nil, err
+	}
+	return profiles, c, nil
+}
+
+// nrfHTTPClient calls the NRF with the gateway's outbound TLS identity (MTLS_OUTBOUND_*), over
+// HTTP/2 only (TS 29.500 clause 5.2.1). OUTBOUND_ALLOWED_DESTINATIONS does not apply: it
+// bounds where NATS-supplied URIs lead, and the NRF's address is the operator's.
+func nrfHTTPClient(cfg *config.Config) (*http.Client, error) {
+	c := sbi.DefaultAmfClientConfig()
+	c.TLSCertFile = cfg.MTLSOutboundCertFile
+	c.TLSKeyFile = cfg.MTLSOutboundKeyFile
+	c.TLSCAFile = cfg.MTLSOutboundCAFile
+	client, err := sbi.NewAmfClientWithConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	return client.Client, nil
+}
+
+// deregister is sbi-gateway nrf-deregister: it removes the NF profiles from the NRF, once the
+// installation's pods have stopped heartbeating them (nrf.Deregisterer). It reads the
+// gateway's configuration; the chart's post-delete hook bounds how long it may take.
+func deregister(ctx context.Context) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("configuration: %w", err)
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
+		return fmt.Errorf("LOG_LEVEL %q: want debug, info, warn or error", cfg.LogLevel)
+	}
+	log := logger.InitLogger("sbi-ha-gateway", level)
+	profiles, client, err := buildNRF(cfg, false) // it serves nothing: no token reaches it
+	if err != nil {
+		return err
+	}
+	if profiles == nil {
+		return errors.New("nrf-deregister: NRF_API_ROOT and NRF_PROFILES_FILE are not set")
+	}
+	return (&nrf.Deregisterer{Client: client, Profiles: profiles, Log: log}).Run(ctx)
 }

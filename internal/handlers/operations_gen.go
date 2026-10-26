@@ -16,6 +16,18 @@
 
 package handlers
 
+// specAPIs is every API the gateway serves, with the full version of its definition.
+var specAPIs = []specAPI{
+	{"nudm-ueau", "v1", "1.2.2"},
+	{"nudm-uecm", "v1", "1.2.7"},
+	{"nudm-sdm", "v2", "2.2.12"},
+	{"nudm-ee", "v1", "1.2.4"},
+	{"nudm-pp", "v1", "1.2.5"},
+	{"nudm-mt", "v1", "1.1.0"},
+	{"nudm-rsds", "v1", "1.1.0"},
+	{"nudr-dr", "v2", "2.2.12"},
+}
+
 // specOperations is every operation the gateway routes, in the specification's terms.
 var specOperations = []specOperation{
 	{"nudm-ueau", "v1", "POST", "/{supiOrSuci}/security-information/generate-auth-data", "GenerateAuthData", []specVar{{"supiOrSuci", varUE, IDSUPI | IDSUCI}}, []int{200}, locNone, []string{"application/json"}, true},

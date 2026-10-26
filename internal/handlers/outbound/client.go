@@ -53,6 +53,11 @@ type Request struct {
 	// a JSON part and a binary part (e.g. Nsmsf_SMService MtForwardSm).
 	Multipart *sbi.Multipart
 
+	// Access is the authorization a Multipart call may need: with it, the call carries an
+	// access token once the producer asks for one. Notifications carry none: their
+	// callbacks state no security in the 3GPP OpenAPI definitions.
+	Access sbi.Access
+
 	// Headers carries optional per-call HTTP headers (e.g. 3gpp-Sbi-Sender-Timestamp).
 	Headers map[string]string
 }

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -667,4 +668,169 @@ func TestRunWithContext_AdminTokenFileUnusable(t *testing.T) {
 			t.Errorf("%s: %v, want an error naming ADMIN_TOKEN_FILE", path, err)
 		}
 	}
+}
+
+// fakeNRF answers NFManagement registrations (201, heartBeatTimer 1 s) and heartbeats (204)
+// over h2c, and records each method.
+type fakeNRF struct {
+	mu      sync.Mutex
+	methods []string
+}
+
+func (f *fakeNRF) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.methods = append(f.methods, r.Method+" "+r.URL.Path+" HTTP/"+strconv.Itoa(r.ProtoMajor))
+	f.mu.Unlock()
+	switch r.Method {
+	case http.MethodPut:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"heartBeatTimer":1}`))
+	case http.MethodPatch:
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (f *fakeNRF) seen() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.methods...)
+}
+
+const testNFInstanceID = "4947a69a-f61b-4bc1-b9da-47c9c5d14b64"
+
+func writeProfiles(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	data := `{"profiles": [{"profile": {"nfInstanceId": "` + testNFInstanceID + `", "nfType": "UDM", "ipv4Addresses": ["10.0.0.1"]}}]}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// Once serving, the gateway registers its profile and heartbeats it at the NRF's interval,
+// over HTTP/2; on SIGTERM it stops heartbeating without deregistering.
+func TestRunWithContext_RegistersWithNRF(t *testing.T) {
+	insecureSBI(t)
+	s := runServer(nil)
+	defer s.Shutdown()
+	nrf := &fakeNRF{}
+	var protocols http.Protocols
+	protocols.SetUnencryptedHTTP2(true)
+	srv := httptest.NewUnstartedServer(nrf)
+	srv.Config.Protocols = &protocols
+	srv.Start()
+	defer srv.Close()
+
+	t.Setenv("NATS_URL", s.ClientURL())
+	t.Setenv("SBI_PORT", "0")
+	t.Setenv("ADMIN_PORT", "0")
+	t.Setenv("SHUTDOWN_DRAIN_DELAY", "0s")
+	t.Setenv("NRF_API_ROOT", srv.URL)
+	t.Setenv("NRF_PROFILES_FILE", writeProfiles(t))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- RunWithContext(ctx) }()
+
+	path := "/nnrf-nfm/v1/nf-instances/" + testNFInstanceID
+	deadline := time.Now().Add(5 * time.Second)
+	for len(nrf.seen()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown timeout")
+	}
+	seen := nrf.seen()
+	if assert.GreaterOrEqual(t, len(seen), 2) {
+		assert.Equal(t, "PUT "+path+" HTTP/2", seen[0])
+		assert.Equal(t, "PATCH "+path+" HTTP/2", seen[1])
+	}
+	for _, m := range seen {
+		assert.NotContains(t, m, "DELETE", "a pod does not deregister")
+	}
+}
+
+func TestBuildNRF(t *testing.T) {
+	profiles := writeProfiles(t)
+	_, _, err := buildNRF(&config.Config{NRFAPIRoot: "https://nrf.example"}, true)
+	assert.ErrorContains(t, err, "both NRF_API_ROOT and NRF_PROFILES_FILE")
+	_, _, err = buildNRF(&config.Config{NRFProfilesFile: profiles}, true)
+	assert.ErrorContains(t, err, "both NRF_API_ROOT and NRF_PROFILES_FILE")
+	p, c, err := buildNRF(&config.Config{}, true)
+	assert.NoError(t, err)
+	assert.Nil(t, p)
+	assert.Nil(t, c)
+
+	// With OAuth on, a token the NRF issues for the profile names its instance ID as aud;
+	// nrf-deregister serves nothing and does not check it.
+	_, _, err = buildNRF(&config.Config{NRFAPIRoot: "http://nrf.example", NRFProfilesFile: profiles, OAuthAudience: "other"}, true)
+	assert.ErrorContains(t, err, "OAUTH_AUDIENCE does not name the UDM profile's nfInstanceId "+testNFInstanceID)
+	_, _, err = buildNRF(&config.Config{NRFAPIRoot: "http://nrf.example", NRFProfilesFile: profiles, OAuthAudience: "other"}, false)
+	assert.NoError(t, err)
+	p, _, err = buildNRF(&config.Config{NRFAPIRoot: "http://nrf.example", NRFProfilesFile: profiles,
+		OAuthAudience: "other, " + testNFInstanceID}, true)
+	assert.NoError(t, err)
+	assert.Len(t, p, 1)
+	_, _, err = buildNRF(&config.Config{NRFAPIRoot: "nrf.example", NRFProfilesFile: profiles, OAuthDisabled: true}, true)
+	assert.ErrorContains(t, err, "NRF_API_ROOT")
+	_, _, err = buildNRF(&config.Config{NRFAPIRoot: "http://nrf.example", NRFProfilesFile: profiles, OAuthDisabled: true,
+		NRFHeartbeatTimer: 1500 * time.Millisecond}, true)
+	assert.ErrorContains(t, err, "whole seconds")
+}
+
+const testGMSCID = "1d5e8b2a-7c4f-4a6e-9b3d-5f1a2c8e4d7b"
+
+func writeGMSCProfile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	data := `{"profiles": [{"profile": {"nfInstanceId": "` + testNFInstanceID + `", "nfType": "UDM", "ipv4Addresses": ["10.0.0.1"]}},
+	  {"profile": {"nfInstanceId": "` + testGMSCID + `", "nfType": "SMS_GMSC", "ipv4Addresses": ["10.0.0.1"]}}]}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The SMS-GMSC serves nothing: no token names it as aud, and OAUTH_AUDIENCE need not.
+func TestBuildNRF_SMSGMSC(t *testing.T) {
+	p, _, err := buildNRF(&config.Config{NRFAPIRoot: "http://nrf.example", NRFProfilesFile: writeGMSCProfile(t),
+		OAuthAudience: testNFInstanceID}, true)
+	if assert.NoError(t, err) && assert.Len(t, p, 2) {
+		assert.True(t, p[1].Consumer)
+	}
+}
+
+// An SMS-GMSC without the SMS path would register an instance that sends nothing.
+func TestRunWithContext_SMSGMSCNeedsSMS(t *testing.T) {
+	insecureSBI(t)
+	t.Setenv("NRF_API_ROOT", "http://nrf.example")
+	t.Setenv("NRF_PROFILES_FILE", writeGMSCProfile(t))
+	assert.ErrorContains(t, RunWithContext(context.Background()), "SMS_GMSC profile and SMS_ENABLED is off")
+}
+
+// The subscriptions are the SMS-GMSC's: without its profile there is nothing to subscribe to.
+func TestRunWithContext_NotificationRootNeedsSMSGMSC(t *testing.T) {
+	insecureSBI(t)
+	t.Setenv("NRF_API_ROOT", "http://nrf.example")
+	t.Setenv("NRF_PROFILES_FILE", writeProfiles(t))
+	t.Setenv("NRF_NOTIFICATION_API_ROOT", "http://sbi-gw.example:8080")
+	assert.ErrorContains(t, RunWithContext(context.Background()), "NRF_NOTIFICATION_API_ROOT is set and NRF_PROFILES_FILE has no SMS_GMSC profile")
+}
+
+func TestRun_Arguments(t *testing.T) {
+	args := os.Args
+	t.Cleanup(func() { os.Args = args })
+	os.Args = []string{"sbi-gateway", "serve"}
+	assert.ErrorContains(t, Run(), `want none, or nrf-deregister`)
+
+	os.Args = []string{"sbi-gateway", "nrf-deregister"}
+	assert.ErrorContains(t, Run(), "NRF_API_ROOT and NRF_PROFILES_FILE are not set")
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,8 +21,10 @@ import (
 // Config is the validator's runtime config — flat on purpose so config.Load()
 // can populate it from env without an intermediate mapper.
 type Config struct {
-	JWKS           JWKSConfig
-	Audience       string        // expected aud claim — this gateway's NF instance ID
+	JWKS JWKSConfig
+	// Audience is the aud a token must carry: this gateway's NF instance ID, or several
+	// separated by commas (one per NF profile it registers, TS 29.510), any of which matches.
+	Audience       string
 	ClockSkew      time.Duration // ± tolerance for exp/nbf/iat checks; default 30s
 	ResultCacheTTL time.Duration // per-token positive cache TTL; 0 disables. Default 60s.
 
@@ -66,7 +69,8 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (Validator, error) {
 	if cfg.ResultCacheTTL == 0 {
 		cfg.ResultCacheTTL = 60 * time.Second
 	}
-	if cfg.Audience == "" {
+	audiences := SplitAudience(cfg.Audience)
+	if len(audiences) == 0 {
 		return nil, errors.New("oauth: Audience is required (set OAUTH_AUDIENCE)")
 	}
 
@@ -77,7 +81,7 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (Validator, error) {
 
 	return &validator{
 		src:                src,
-		audience:           cfg.Audience,
+		audiences:          audiences,
 		skew:               cfg.ClockSkew,
 		resultTTL:          cfg.ResultCacheTTL,
 		requireCertBinding: cfg.RequireCertBinding,
@@ -87,7 +91,7 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (Validator, error) {
 
 type validator struct {
 	src                keySource
-	audience           string
+	audiences          []string
 	skew               time.Duration
 	requireCertBinding bool
 
@@ -132,7 +136,7 @@ func (v *validator) Validate(ctx context.Context, bearer string, peerCertThumbpr
 		),
 		jwt.WithValidate(true),
 		jwt.WithAcceptableSkew(v.skew),
-		jwt.WithAudience(v.audience),
+		jwt.WithValidator(audienceIn(v.audiences)),
 		jwt.WithRequiredClaim("sub"),
 		jwt.WithRequiredClaim("iss"),
 		jwt.WithRequiredClaim("scope"),
@@ -184,6 +188,30 @@ func (v *validator) checkCertBinding(claims *Claims, peerCertThumbprint []byte) 
 		return newErr(ReasonCnfMismatch, errors.New("peer cert thumbprint does not match cnf.x5t#S256"))
 	}
 	return nil
+}
+
+// SplitAudience returns the audiences of a comma-separated list, without blanks.
+func SplitAudience(s string) []string {
+	var out []string
+	for _, a := range strings.Split(s, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// audienceIn accepts a token whose aud names any of audiences (RFC 7519 clause 4.1.3: aud
+// may hold several values; one must identify the recipient).
+func audienceIn(audiences []string) jwt.Validator {
+	return jwt.ValidatorFunc(func(_ context.Context, tok jwt.Token) jwt.ValidationError {
+		for _, a := range tok.Audience() {
+			if slices.Contains(audiences, a) {
+				return nil
+			}
+		}
+		return jwt.ErrInvalidAudience()
+	})
 }
 
 // bytesEqualConstantTime is subtle.ConstantTimeCompare's result-as-bool

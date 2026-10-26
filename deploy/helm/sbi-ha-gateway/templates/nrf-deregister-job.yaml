@@ -1,0 +1,94 @@
+{{- if and (include "sbi-ha-gateway.nrfEnabled" .) .Values.config.nrf.deregister.enabled }}
+{{- /*
+  helm uninstall: delete the NF profiles from the NRF (sbi-gateway nrf-deregister). A post-delete
+  hook, not pre-delete: before the release's resources are deleted its pods still heartbeat, and
+  a heartbeat the NRF answers 404 registers the instance again. The Job deletes, waits a
+  heartbeat interval and deletes again until a delete finds nothing.
+
+  The release's ConfigMap and ServiceAccount are gone by then: the Job carries its own copy of
+  the profiles and runs under the namespace's default ServiceAccount, without its token. The
+  outbound TLS files come from extraVolumes, which the operator owns.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}-nrf-deregister
+  labels:
+    {{- include "sbi-ha-gateway.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-delete
+    helm.sh/hook-weight: "-1"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+data:
+  profiles.json: |
+    {{- include "sbi-ha-gateway.nrfProfiles" . | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}-nrf-deregister
+  labels:
+    {{- include "sbi-ha-gateway.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-delete
+    helm.sh/hook-weight: "0"
+    # A failed Job stays for its log; the next uninstall's replaces it.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: {{ .Values.config.nrf.deregister.timeoutSeconds | int }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbi-ha-gateway.labels" . | nindent 8 }}
+        app.kubernetes.io/component: nrf-deregister
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: nrf-deregister
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["nrf-deregister"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            {{- if .Values.tls.existingSecret }}
+            # The SBI scheme of the profiles (https); the certificate itself is not read.
+            - name: TLS_CERT_FILE
+              value: "{{ .Values.tls.mountPath }}/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "{{ .Values.tls.mountPath }}/tls.key"
+            {{- end }}
+            {{- include "sbi-ha-gateway.nrfEnv" . | nindent 12 }}
+            {{- include "sbi-ha-gateway.outboundTLSEnv" . | nindent 12 }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          volumeMounts:
+            - name: nrf-profiles
+              mountPath: /etc/sbi-gateway/nrf
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: nrf-profiles
+          configMap:
+            name: {{ include "sbi-ha-gateway.fullname" . }}-nrf-deregister
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

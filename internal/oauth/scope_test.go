@@ -16,6 +16,11 @@ func TestRequiredScope(t *testing.T) {
 		{"/nsmf-pdusession/v1/sm-contexts/abc", "nsmf-pdusession"},
 		{"/livez", ""},  // bypass
 		{"/readyz", ""}, // bypass
+		// The NRF's notifications: that shape alone.
+		{"/nrf-notify/v1/0123456789abcdef0123456789abcdef/fedcba9876543210fedcba9876543210", ""},
+		{"/nrf-notify/v1/0123456789abcdef0123456789abcdef/fedcba9876543210fedcba9876543210/x", "nrf-notify"},
+		{"/nrf-notify/v1/../../nudm-sdm/v2/imsi-001/am-data", "nrf-notify"},
+		{"/nrf-notify/v1/0123456789ABCDEF0123456789ABCDEF/fedcba9876543210fedcba9876543210", "nrf-notify"},
 		// Pathological paths still fail-closed: the derived scope can't
 		// possibly match an issued token, so the request is rejected.
 		{"/", ""},

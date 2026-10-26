@@ -29,10 +29,9 @@ type Client struct {
 	conn *nats.Conn
 	log  *slog.Logger
 
-	// js is lazily initialised on first JetStream() call. We don't open it
-	// at connect time because OTA's JetStream consumer is opt-in via the
-	// JETSTREAM_ENABLED env; deployments without OTA shouldn't pay the
-	// startup cost of probing for a JetStream API.
+	// js is lazily initialised on first JetStream() call. It is not opened at connect time:
+	// only the SMS surfaces (SMS_ENABLED) use JetStream, and a deployment without them should
+	// not pay the startup cost of probing for a JetStream API.
 	js jetstream.JetStream
 }
 

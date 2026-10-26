@@ -19,10 +19,11 @@ func unsetConfigEnv(t *testing.T) {
 		MTLS_CLIENT_AUTH_MODE MTLS_CLIENT_CA_FILE MTLS_OUTBOUND_CA_FILE MTLS_OUTBOUND_CERT_FILE
 		MTLS_OUTBOUND_KEY_FILE NATS_CONNECT_TIMEOUT NATS_REQUEST_TIMEOUT NATS_URL NATS_CREDS_FILE
 		NATS_NKEY_SEED_FILE NATS_USER NATS_PASSWORD_FILE NATS_TOKEN_FILE NATS_TLS_CA_FILE
-		NATS_TLS_CERT_FILE NATS_TLS_KEY_FILE OAUTH_AUDIENCE
+		NATS_TLS_CERT_FILE NATS_TLS_KEY_FILE NRF_NOTIFICATION_API_ROOT OAUTH_AUDIENCE
 		OAUTH_CLOCK_SKEW OAUTH_DISABLED OAUTH_JWKS_FILE OAUTH_JWKS_REFRESH OAUTH_NRF_JWKS_URL
-		OAUTH_REQUIRE_CERT_BINDING OAUTH_RESULT_CACHE_TTL OTA_ENABLED OTA_RESOLVER_FILE
-		OTA_UECM_TIMEOUT OUTBOUND_PROFILE OUTBOUND_ALLOWED_DESTINATIONS OUTBOUND_ALLOW_ANY RATE_LIMIT_BURST RATE_LIMIT_RPS RETRY_BASE_DELAY
+		OAUTH_REQUIRE_CERT_BINDING OAUTH_RESULT_CACHE_TTL SMS_ENABLED SMS_RESOLVER_FILE
+		SMS_UECM_TIMEOUT SMS_STREAM SMS_DELIVERY_EVENT_SUBJECT OTA_ENABLED OTA_RESOLVER_FILE OTA_UECM_TIMEOUT
+		OUTBOUND_PROFILE OUTBOUND_ALLOWED_DESTINATIONS OUTBOUND_ALLOW_ANY RATE_LIMIT_BURST RATE_LIMIT_RPS RETRY_BASE_DELAY
 		SBI_PORT SHUTDOWN_DRAIN_DELAY TLS_CERT_FILE TLS_KEY_FILE ALLOW_PLAINTEXT_SBI`) {
 		t.Setenv(k, "")
 	}
@@ -79,12 +80,15 @@ func TestLoad_FromEnv(t *testing.T) {
 func TestLoad_InvalidValues(t *testing.T) {
 	for key, val := range map[string]string{
 		"OAUTH_DISABLED":       "fasle",
-		"OTA_ENABLED":          "ture",
+		"SMS_ENABLED":          "ture",
 		"RATE_LIMIT_RPS":       "100/s",
 		"RATE_LIMIT_BURST":     "lots",
 		"MAX_RETRIES":          "3x",
 		"NATS_REQUEST_TIMEOUT": "2",
 		"SHUTDOWN_DRAIN_DELAY": "five seconds",
+		"SMS_STREAM":           "SMS.SEND",
+		// A wildcard would receive, not name, a subject.
+		"SMS_DELIVERY_EVENT_SUBJECT": "sms.delivery.>",
 	} {
 		t.Run(key, func(t *testing.T) {
 			unsetConfigEnv(t)
@@ -99,6 +103,19 @@ func TestLoad_InvalidValues(t *testing.T) {
 	t.Setenv("RATE_LIMIT_RPS", "NaN")
 	if _, err := Load(); err == nil {
 		t.Error("RATE_LIMIT_RPS=NaN accepted")
+	}
+}
+
+// A variable renamed in 0.5.0 stops the gateway rather than switching the SMS surfaces off.
+func TestLoad_RenamedVariables(t *testing.T) {
+	for old, now := range map[string]string{
+		"OTA_ENABLED": "SMS_ENABLED", "OTA_RESOLVER_FILE": "SMS_RESOLVER_FILE", "OTA_UECM_TIMEOUT": "SMS_UECM_TIMEOUT",
+	} {
+		unsetConfigEnv(t)
+		t.Setenv(old, "true")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), old+" was renamed "+now) {
+			t.Errorf("%s set: got %v", old, err)
+		}
 	}
 }
 

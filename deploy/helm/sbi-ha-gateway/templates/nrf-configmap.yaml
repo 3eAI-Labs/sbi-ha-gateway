@@ -1,0 +1,12 @@
+{{- if include "sbi-ha-gateway.nrfEnabled" . }}
+# The NF profiles the gateway registers with the NRF (NRF_PROFILES_FILE; config.nrf.profiles).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sbi-ha-gateway.fullname" . }}-nrf
+  labels:
+    {{- include "sbi-ha-gateway.labels" . | nindent 4 }}
+data:
+  profiles.json: |
+    {{- include "sbi-ha-gateway.nrfProfiles" . | nindent 4 }}
+{{- end }}

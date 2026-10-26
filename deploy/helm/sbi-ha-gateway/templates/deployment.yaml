@@ -1,6 +1,15 @@
-{{- if and .Values.config.ota.enabled (include "sbi-ha-gateway.natsBundled" .) -}}
-{{- fail "config.ota.enabled needs config.nats.url: the SMS stream OTA_OUTBOUND is on the applications' NATS, and the bundled NATS has no JetStream." -}}
+{{- range .Values.config.nrf.profiles }}
+{{- if and (eq .profile.nfType "SMS_GMSC") (not $.Values.config.sms.enabled) }}
+{{- fail "config.nrf.profiles has an SMS_GMSC profile and config.sms.enabled is false: the gateway would register an SMS-GMSC that sends no SMS." }}
+{{- end }}
+{{- if and (eq .profile.nfType "SMS_GMSC") .service }}
+{{- fail "config.nrf.profiles: the SMS_GMSC profile registers no service; remove its \"service\"." }}
+{{- end }}
+{{- end }}
+{{- if and .Values.config.sms.enabled (include "sbi-ha-gateway.natsBundled" .) -}}
+{{- fail "config.sms.enabled needs config.nats.url: the SMS go through a JetStream stream, and the bundled NATS has no JetStream." -}}
 {{- end -}}
+{{- include "sbi-ha-gateway.nrfCheck" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,8 +25,13 @@ spec:
       {{- include "sbi-ha-gateway.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- /* A changed NRF profile rolls the pods, which register it. */}}
+      {{- $annotations := deepCopy (.Values.podAnnotations | default dict) }}
+      {{- if include "sbi-ha-gateway.nrfEnabled" . }}
+      {{- $_ := set $annotations "checksum/nrf-profiles" (include "sbi-ha-gateway.nrfProfiles" . | sha256sum) }}
+      {{- end }}
       annotations:
-        {{- toYaml .Values.podAnnotations | nindent 8 }}
+        {{- toYaml $annotations | nindent 8 }}
       labels:
         {{- include "sbi-ha-gateway.selectorLabels" . | nindent 8 }}
     spec:
@@ -56,6 +70,15 @@ spec:
       {{- if and (not $oauthOff) (or (not .Values.config.oauth.audience) (and (not .Values.config.oauth.nrfJwksUrl) (not .Values.config.oauth.jwksFile))) }}
       {{- if $trial }}{{- $oauthOff = true }}{{- else }}
       {{- fail "config.oauth needs audience and nrfJwksUrl (or jwksFile), or config.oauth.disabled=true" }}
+      {{- end }}
+      {{- end }}
+      {{- if not $oauthOff }}
+      {{- /* A token the NRF issues for a registered profile names its instance ID as aud. */}}
+      {{- $audiences := regexSplit "\\s*,\\s*" (trim .Values.config.oauth.audience) -1 }}
+      {{- range .Values.config.nrf.profiles }}
+      {{- if and (ne .profile.nfType "SMS_GMSC") (not (has .profile.nfInstanceId $audiences)) }}
+      {{- fail (printf "config.oauth.audience must list the %s profile's nfInstanceId %s: tokens the NRF issues for it would be refused" .profile.nfType .profile.nfInstanceId) }}
+      {{- end }}
       {{- end }}
       {{- end }}
       containers:
@@ -149,27 +172,32 @@ spec:
               value: {{ .Values.config.oauth.resultCacheTTL | quote }}
             - name: OAUTH_REQUIRE_CERT_BINDING
               value: {{ .Values.config.oauth.requireCertBinding | quote }}
-            # Outbound / OTA / Audit
+            # Outbound / SMS / Audit
             - name: OUTBOUND_PROFILE
               value: {{ .Values.config.outbound.profile | quote }}
             - name: OUTBOUND_ALLOWED_DESTINATIONS
               value: {{ join "," .Values.config.outbound.allowedDestinations | quote }}
             - name: OUTBOUND_ALLOW_ANY
               value: {{ .Values.config.outbound.allowAny | quote }}
-            {{- with .Values.config.mtls }}
-            {{- range $env, $path := dict "MTLS_OUTBOUND_CERT_FILE" .outboundCertFile "MTLS_OUTBOUND_KEY_FILE" .outboundKeyFile "MTLS_OUTBOUND_CA_FILE" .outboundCAFile }}
-            {{- if $path }}
-            - name: {{ $env }}
-              value: {{ $path | quote }}
+            {{- include "sbi-ha-gateway.outboundTLSEnv" . | nindent 12 }}
+            {{- if include "sbi-ha-gateway.nrfEnabled" . }}
+            # NRF registration (TS 29.510)
+            {{- include "sbi-ha-gateway.nrfEnv" . | nindent 12 }}
+            {{- with .Values.config.nrf.notificationApiRoot }}
+            - name: NRF_NOTIFICATION_API_ROOT
+              value: {{ . | quote }}
             {{- end }}
             {{- end }}
-            {{- end }}
-            - name: OTA_ENABLED
-              value: {{ .Values.config.ota.enabled | quote }}
-            - name: OTA_RESOLVER_FILE
-              value: {{ .Values.config.ota.resolverFile | quote }}
-            - name: OTA_UECM_TIMEOUT
-              value: {{ .Values.config.ota.uecmTimeout | quote }}
+            - name: SMS_ENABLED
+              value: {{ .Values.config.sms.enabled | quote }}
+            - name: SMS_RESOLVER_FILE
+              value: {{ .Values.config.sms.resolverFile | quote }}
+            - name: SMS_UECM_TIMEOUT
+              value: {{ .Values.config.sms.uecmTimeout | quote }}
+            - name: SMS_STREAM
+              value: {{ .Values.config.sms.stream | quote }}
+            - name: SMS_DELIVERY_EVENT_SUBJECT
+              value: {{ .Values.config.sms.deliveryEventSubject | quote }}
             - name: AUDIT_DISABLED
               value: {{ .Values.config.audit.disabled | quote }}
             - name: AUDIT_NATS_SUBJECT
@@ -201,7 +229,7 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.config.admin.auth .Values.extraVolumeMounts }}
+          {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.config.admin.auth .Values.extraVolumeMounts (include "sbi-ha-gateway.nrfEnabled" .) }}
           volumeMounts:
             {{- if .Values.tls.existingSecret }}
             - name: tls
@@ -218,11 +246,16 @@ spec:
               mountPath: /etc/sbi-gateway/admin
               readOnly: true
             {{- end }}
+            {{- if include "sbi-ha-gateway.nrfEnabled" . }}
+            - name: nrf-profiles
+              mountPath: /etc/sbi-gateway/nrf
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
-      {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.config.admin.auth .Values.extraVolumes }}
+      {{- if or .Values.tls.existingSecret .Values.config.nats.secret.name .Values.config.admin.auth .Values.extraVolumes (include "sbi-ha-gateway.nrfEnabled" .) }}
       volumes:
         {{- if .Values.tls.existingSecret }}
         - name: tls
@@ -241,6 +274,11 @@ spec:
           secret:
             secretName: {{ include "sbi-ha-gateway.adminTokenSecret" . }}
             defaultMode: 0440
+        {{- end }}
+        {{- if include "sbi-ha-gateway.nrfEnabled" . }}
+        - name: nrf-profiles
+          configMap:
+            name: {{ include "sbi-ha-gateway.fullname" . }}-nrf
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

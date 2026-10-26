@@ -43,7 +43,7 @@ func (c *sbiDirectClient) Send(ctx context.Context, req *Request) (*Response, er
 	}
 
 	if req.Multipart != nil {
-		parts, err := c.http.PostMultipart(ctx, req.CallbackURI, *req.Multipart)
+		parts, err := c.http.PostMultipart(ctx, req.CallbackURI, *req.Multipart, req.Access)
 		if err != nil {
 			var httpErr *sbi.HTTPError
 			if errors.As(err, &httpErr) {

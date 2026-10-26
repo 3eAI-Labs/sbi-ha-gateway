@@ -63,6 +63,26 @@ type specOperation struct {
 	BodyRequired bool
 }
 
+// specAPI is one API the gateway serves (operations_gen.go).
+type specAPI struct {
+	Name, VersionInURI, FullVersion string
+}
+
+// API is one API the gateway serves, as TS 29.510 NFServiceVersion names its versions:
+// the version in the URI ("v2") and the full version of its OpenAPI definition ("2.2.12").
+type API struct {
+	Name, VersionInURI, FullVersion string
+}
+
+// ServedAPIs returns every API the gateway serves, in the order of operations_gen.go.
+func ServedAPIs() []API {
+	out := make([]API, len(specAPIs))
+	for i, a := range specAPIs {
+		out[i] = API(a)
+	}
+	return out
+}
+
 // subject is the NATS subject the operation goes to. Subjects are the NATS permission
 // boundaries: what returns authentication vectors goes to SubjectAuthRequest alone.
 func (op *specOperation) subject() string {

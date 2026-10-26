@@ -165,6 +165,50 @@ config:
     resultCacheTTL: "60s"
     requireCertBinding: false
 
+  # Registration with the NRF (TS 29.510 Nnrf_NFManagement); off while apiRoot is empty. The
+  # installation is one NF instance per profile, whatever replicaCount: every pod registers the
+  # same profile and heartbeats it, and a stopping pod does not deregister, since the others
+  # serve on. The NRF is called over HTTP/2 with the outbound TLS files (config.mtls).
+  nrf:
+    apiRoot: ""          # the NRF's {apiRoot}, e.g. https://nrf.5gc.mnc001.mcc001.3gppnetwork.org
+    heartbeatTimer: ""   # interval to propose, whole seconds ("30s"); empty: the NRF's
+    # The {apiRoot} the NRF reaches the SBI port at, through the Service, e.g.
+    # https://sbi-gw.5gc.svc.cluster.local:8443 (with TLS, a name the SBI certificate holds).
+    # Set, each pod subscribes to the SMSFs it discovers (NFStatusSubscribe), and their
+    # deregistration or profile change makes it ask the NRF again at the next SMS rather than
+    # at the end of the validityPeriod. Needs the SMS_GMSC profile. Empty: no subscription.
+    notificationApiRoot: ""
+    # One entry per NF type, UDM and/or UDR, and SMS_GMSC. "profile" is a TS 29.510 NFProfile:
+    # nfInstanceId (a lower-case UUID v4, also listed in config.oauth.audience), nfType, an
+    # address (fqdn; with TLS it must be an FQDN), and plmnList, udmInfo/udrInfo, priority, ...
+    # as needed. The SMS_GMSC profile (with config.sms.enabled) registers no service: it is
+    # the instance MT SMS goes to the SMSF as: an SMSF named by instance ID is discovered as it,
+    # and the access tokens an SMSF asks for are its own. Give it no "service", and leave it out
+    # of config.oauth.audience.
+    # "service" holds NFService attributes added to each service registered, such as
+    # ipEndPoints. With TLS, consumers that build the URI from the fqdn use port 443: serve the
+    # SBI there (service.sbiPort), or give ipEndPoints the address with the port; some NRFs drop
+    # an entry with only a port (Open5GS 2.7.6, measured).
+    # The gateway adds nfStatus, heartBeatTimer and its services (nudm-* for the UDM, nudr-dr
+    # for the UDR), with their versions, scheme and oauth2Required.
+    #   - profile:
+    #       nfInstanceId: 4947a69a-f61b-4bc1-b9da-47c9c5d14b64
+    #       nfType: UDM
+    #       fqdn: udm.5gc.mnc001.mcc001.3gppnetwork.org
+    #       plmnList: [{mcc: "001", mnc: "01"}]
+    #       udmInfo: {groupId: udm-1}
+    #     service:
+    #       allowedNfTypes: [AMF, AUSF, SMF, SMSF]
+    profiles: []
+    # On helm uninstall a post-delete Job deletes the profiles from the NRF, once no pod
+    # heartbeats them: it deletes, waits a heartbeat interval and deletes again until nothing
+    # is left. It fails the uninstall if the NRF cannot be reached within timeoutSeconds;
+    # `helm uninstall --no-hooks` skips it, and the NRF then suspends the instance when the
+    # heartbeats stop. Keep timeoutSeconds within helm's --timeout (default 5m).
+    deregister:
+      enabled: true
+      timeoutSeconds: 290
+
   # Delivery of data-change notifications: sbi_direct | scef_rest.
   outbound:
     profile: "sbi_direct"
@@ -174,12 +218,17 @@ config:
     allowedDestinations: []
     allowAny: false   # true: any host but those always refused
 
-  # SMS (OTA) surfaces: serving-SMSF lookup and Nsmsf MtForwardSm. Off until opted in; needs
-  # config.nats.url (the stream OTA_OUTBOUND lives on the applications' NATS).
-  ota:
+  # SMS surfaces: serving-SMSF lookup and Nsmsf MtForwardSm. Off until opted in; needs
+  # config.nats.url, a NATS with JetStream (the bundled one has none). The gateway consumes the
+  # stream that captures sbi.outbound.nsmsf.send.request, whatever its name, and creates one
+  # named `stream` (a work queue, one replica) when none does: create it beforehand to choose
+  # its replicas and limits. Each SMS's result goes to deliveryEventSubject.
+  sms:
     enabled: false
     resolverFile: ""
     uecmTimeout: "3s"
+    stream: "SBI_SMSF_SEND"
+    deliveryEventSubject: "sbi.nsmsf.delivery.event"
 
   # Audit of state-changing operations. Subject may be tenant-prefixed for multi-tenant clusters.
   audit:
@@ -187,7 +236,7 @@ config:
     natsSubject: "audit.events"
 
 # Further volumes for files the gateway reads by path — the outbound TLS files, a JWKS file
-# (config.oauth.jwksFile), the OTA resolver (config.ota.resolverFile) — usually a Secret or a
+# (config.oauth.jwksFile), the SMS resolver (config.sms.resolverFile) — usually a Secret or a
 # ConfigMap, mounted read-only.
 extraVolumes: []
 extraVolumeMounts: []
@@ -209,7 +258,7 @@ tls:
 
 # Bundled NATS, used only when config.nats.url is empty: a single-replica, core-only NATS
 # (no JetStream, no storage) so that an install with the chart's defaults starts and becomes
-# Ready, as Arinna's onboarding render and smoke install do. NOT for production: there the
+# Ready, for a trial or a smoke test. NOT for production: there the
 # gateway must reach the applications' NATS, so set config.nats.url to it. With a URL set,
 # nothing below is deployed. With nats.deploy=false and no URL the chart refuses to render.
 nats:

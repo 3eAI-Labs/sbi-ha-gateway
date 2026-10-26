@@ -248,38 +248,38 @@ func TestRecordOutboundPosition(t *testing.T) {
 	}
 }
 
-// --- SMS (OTA) surfaces ----------------------------------------------------
+// --- SMS surfaces ----------------------------------------------------------
 
-func TestRecordOtaUecmLookup(t *testing.T) {
+func TestRecordSMSUecmLookup(t *testing.T) {
 	// "not_found" is the *expected* default until UDM client lands — this
 	// test pins that expectation so a future contributor can't quietly
 	// rename the result string without updating dashboards.
-	RecordOtaUecmLookup("not_found")
-	RecordOtaUecmLookup("ok")
-	RecordOtaUecmLookup("not_found")
+	RecordSMSUecmLookup("not_found")
+	RecordSMSUecmLookup("ok")
+	RecordSMSUecmLookup("not_found")
 
-	if got := counterValue(t, OtaUecmLookups.WithLabelValues("not_found")); got != 2 {
-		t.Errorf("OtaUecmLookups[not_found] = %v, want 2", got)
+	if got := counterValue(t, SMSUecmLookups.WithLabelValues("not_found")); got != 2 {
+		t.Errorf("SMSUecmLookups[not_found] = %v, want 2", got)
 	}
-	if got := counterValue(t, OtaUecmLookups.WithLabelValues("ok")); got != 1 {
-		t.Errorf("OtaUecmLookups[ok] = %v, want 1", got)
+	if got := counterValue(t, SMSUecmLookups.WithLabelValues("ok")); got != 1 {
+		t.Errorf("SMSUecmLookups[ok] = %v, want 1", got)
 	}
 }
 
-func TestRecordOtaSmsfSend(t *testing.T) {
+func TestRecordSMSSmsfSend(t *testing.T) {
 	for _, result := range []string{"delivered", "failed", "client_error", "bypassed", "not_implemented"} {
-		RecordOtaSmsfSend(result)
-		if got := counterValue(t, OtaSmsfSends.WithLabelValues(result)); got != 1 {
-			t.Errorf("OtaSmsfSends[%s] = %v, want 1", result, got)
+		RecordSMSSmsfSend(result)
+		if got := counterValue(t, SMSSmsfSends.WithLabelValues(result)); got != 1 {
+			t.Errorf("SMSSmsfSends[%s] = %v, want 1", result, got)
 		}
 	}
 }
 
-func TestRecordOtaDeliveryEvent(t *testing.T) {
+func TestRecordSMSDeliveryEvent(t *testing.T) {
 	for _, status := range []string{"DELIVERED", "FAILED", "PENDING"} {
-		RecordOtaDeliveryEvent(status)
-		if got := counterValue(t, OtaDeliveryEventsPublished.WithLabelValues(status)); got != 1 {
-			t.Errorf("OtaDeliveryEventsPublished[%s] = %v, want 1", status, got)
+		RecordSMSDeliveryEvent(status)
+		if got := counterValue(t, SMSDeliveryEventsPublished.WithLabelValues(status)); got != 1 {
+			t.Errorf("SMSDeliveryEventsPublished[%s] = %v, want 1", status, got)
 		}
 	}
 }

@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$comment": "Arinna machine-API surface for the SBI HA Gateway chart (Product Packaging Contract v2.0 §2/§2.1): draft-07, additionalProperties:false with a global escape, x-arinna discipline. Fields carrying `x-arinna` are Arinna-tunable ProductDefinition properties (§2.1 exposure boundary); fields without it keep chart defaults. Chart-only — stateless HTTP/2↔NATS bridge, no CRD/operator. opsTrigger N/A (no in-app reconciler). Config surface mirrors internal/config/config.go.",
+  "$comment": "The chart's values (draft-07): additionalProperties false, with a global escape. A stateless HTTP/2 to NATS bridge, chart-only, without CRD or operator; the config surface mirrors internal/config/config.go.",
   "title": "sbi-ha-gateway Helm values",
   "type": "object",
   "additionalProperties": false,
@@ -9,13 +9,12 @@
     "global": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Helm-injected global values. Not Arinna-addressable."
+      "description": "Helm-injected global values."
     },
 
     "replicaCount": {
       "type": "integer", "minimum": 1, "maximum": 32,
-      "description": "Number of gateway pods. Stateless; NATS queue-group shares load.",
-      "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low", "serviceLevelPreset": true }
+      "description": "Number of gateway pods. Stateless; NATS queue-group shares load."
     },
 
     "nameOverride": { "type": "string" },
@@ -116,8 +115,7 @@
             "memory": { "type": "string", "pattern": "^[0-9]+(Mi|Gi|Ki|M|G|K)$" }
           }
         }
-      },
-      "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low", "serviceLevelPreset": true }
+      }
     },
 
     "autoscaling": {
@@ -128,8 +126,7 @@
         "minReplicas": { "type": "integer", "minimum": 1, "maximum": 32 },
         "maxReplicas": { "type": "integer", "minimum": 1, "maximum": 64 },
         "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
-      },
-      "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low", "serviceLevelPreset": true }
+      }
     },
 
     "pdb": {
@@ -138,8 +135,7 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "minAvailable": {
-          "type": "integer", "minimum": 0,
-          "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium", "serviceLevelPreset": true }
+          "type": "integer", "minimum": 0
         }
       }
     },
@@ -169,26 +165,22 @@
           "properties": {
             "auth": {
               "type": "boolean",
-              "description": "/metrics and /admin/* require a bearer token. false is an explicit opt-out (a WARN and sbi_gateway_security_protection{protection=\"admin_auth\"} 0 say so). A high-risk security change.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+              "description": "/metrics and /admin/* require a bearer token. false is an explicit opt-out (a WARN and sbi_gateway_security_protection{protection=\"admin_auth\"} 0 say so). A high-risk security change."
             },
             "tokenSecret": {
               "type": "string",
-              "description": "Secret holding the bearer token. Empty: the chart creates <fullname>-admin-token with a random token.",
-              "x-arinna": { "userExposed": false, "secretRef": true, "requiresApproval": true, "riskClass": "high" }
+              "description": "Secret holding the bearer token. Empty: the chart creates <fullname>-admin-token with a random token."
             },
             "tokenKey": { "type": "string", "minLength": 1, "description": "Key of the token in tokenSecret." },
             "tls": {
               "type": "boolean",
-              "description": "Serve the admin port with tls.existingSecret's certificate; the probes use HTTPS. false is an explicit opt-out; a trial install without TLS switches it off itself. A high-risk security change.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+              "description": "Serve the admin port with tls.existingSecret's certificate; the probes use HTTPS. false is an explicit opt-out; a trial install without TLS switches it off itself. A high-risk security change."
             }
           }
         },
         "logLevel": {
           "type": "string",
-          "enum": ["debug", "info", "warn", "error"],
-          "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+          "enum": ["debug", "info", "warn", "error"]
         },
         "nats": {
           "type": "object",
@@ -197,8 +189,7 @@
           "properties": {
             "url": {
               "type": "string",
-              "description": "URL of the NATS the applications use. Empty: the chart deploys its own core NATS (nats.deploy) for a trial install, which no application is connected to; required when nats.deploy is false. Changing it rolls the pods.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true }
+              "description": "URL of the NATS the applications use. Empty: the chart deploys its own core NATS (nats.deploy) for a trial install, which no application is connected to; required when nats.deploy is false. Changing it rolls the pods."
             },
             "connectTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
             "requestTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
@@ -264,12 +255,10 @@
           "description": "Per-client token bucket in front of the back end. rps=0 disables.",
           "properties": {
             "rps": {
-              "type": "number", "minimum": 0,
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium" }
+              "type": "number", "minimum": 0
             },
             "burst": {
-              "type": "integer", "minimum": 0,
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium" }
+              "type": "integer", "minimum": 0
             }
           }
         },
@@ -289,8 +278,7 @@
           "properties": {
             "allowPlaintextSbi": {
               "type": "boolean",
-              "description": "Serve cleartext h2c without tls.existingSecret. A high-risk security change.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+              "description": "Serve cleartext h2c without tls.existingSecret. A high-risk security change."
             }
           }
         },
@@ -303,8 +291,7 @@
             "clientAuthMode": {
               "type": "string",
               "enum": ["off", "optional", "require"],
-              "description": "Inbound client certificates. Default require: needs tls.existingSecret with ca.crt and clientCAFile. Security-critical — approval-gated.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+              "description": "Inbound client certificates. Default require: needs tls.existingSecret with ca.crt and clientCAFile. Security-critical — approval-gated."
             },
             "outboundCertFile": { "type": "string" },
             "outboundKeyFile": { "type": "string" },
@@ -318,17 +305,14 @@
           "properties": {
             "disabled": {
               "type": "boolean",
-              "description": "Auth kill switch: true accepts SBI requests without an access token. Default false: set audience and nrfJwksUrl (or jwksFile). A high-risk security change.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+              "description": "Auth kill switch: true accepts SBI requests without an access token. Default false: set audience and nrfJwksUrl (or jwksFile). A high-risk security change."
             },
             "audience": {
               "type": "string",
-              "description": "Expected aud claim (this NF's instance ID).",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high" }
+              "description": "Expected aud claim (this NF's instance ID)."
             },
             "nrfJwksUrl": {
-              "type": "string",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high" }
+              "type": "string"
             },
             "jwksFile": { "type": "string" },
             "jwksRefresh": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
@@ -336,8 +320,82 @@
             "resultCacheTTL": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
             "requireCertBinding": {
               "type": "boolean",
-              "description": "RFC 8705 — reject tokens without cnf. Pair with mTLS.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high" }
+              "description": "RFC 8705 — reject tokens without cnf. Pair with mTLS."
+            }
+          }
+        },
+        "nrf": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Registration with the NRF (TS 29.510 Nnrf_NFManagement); off while apiRoot is empty. The installation is one NF instance per profile, whatever its replica count: every pod registers the same profile and heartbeats it.",
+          "properties": {
+            "apiRoot": {
+              "type": "string",
+              "pattern": "^(https?://[^/?#@]+(/[^?#]*)?)?$",
+              "description": "The NRF's {apiRoot} (scheme://host[:port][/prefix]); empty: no registration. Needs profiles."
+            },
+            "heartbeatTimer": {
+              "type": "string",
+              "pattern": "^([0-9]+s)?$",
+              "description": "Heartbeat interval proposed at registration, whole seconds (\"30s\"); empty: the NRF's."
+            },
+            "notificationApiRoot": {
+              "type": "string",
+              "pattern": "^(https?://[^/?#@]+(/[^?#]*)?)?$",
+              "description": "The {apiRoot} the NRF reaches the SBI port at (https with TLS); set, each pod subscribes to the SMSFs it discovers. Needs the SMS_GMSC profile; empty: no subscription."
+            },
+            "profiles": {
+              "type": "array",
+              "maxItems": 3,
+              "description": "One entry per NF type (UDM, UDR, SMS_GMSC): \"profile\", a TS 29.510 NFProfile (nfInstanceId, nfType, an address, udmInfo/udrInfo, ...), and \"service\", NFService attributes added to each service registered (none for the SMS_GMSC, which registers no service: the instance MT SMS is sent to the SMSF as, with its access tokens; needs config.sms.enabled). Its SUPI ranges and group decide which subscribers' traffic consumers send here: a high-risk change.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "profile"
+                ],
+                "properties": {
+                  "profile": {
+                    "type": "object",
+                    "required": [
+                      "nfInstanceId",
+                      "nfType"
+                    ],
+                    "properties": {
+                      "nfInstanceId": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "description": "A UUID version 4 in lower case (TS 29.510 clause 5.2.2.2.2); also in config.oauth.audience, but for the SMS_GMSC's."
+                      },
+                      "nfType": {
+                        "type": "string",
+                        "enum": [
+                          "UDM",
+                          "UDR",
+                          "SMS_GMSC"
+                        ]
+                      }
+                    }
+                  },
+                  "service": {
+                    "type": "object"
+                  }
+                }
+              }
+            },
+            "deregister": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "The post-delete Job that removes the profiles from the NRF on helm uninstall.",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "timeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 30
+                }
+              }
             }
           }
         },
@@ -348,33 +406,39 @@
             "profile": {
               "type": "string",
               "enum": ["sbi_direct", "scef_rest"],
-              "description": "Delivery of data-change notifications: sbi_direct POSTs to the callback URI, scef_rest leaves it to an external adapter.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "medium" }
+              "description": "Delivery of data-change notifications: sbi_direct POSTs to the callback URI, scef_rest leaves it to an external adapter."
             },
             "allowedDestinations": {
               "type": "array",
               "items": { "type": "string", "pattern": "^([*]?[.]?[A-Za-z0-9.-]+|[0-9A-Fa-f:.]+(/[0-9]{1,3})?)$" },
-              "description": "Hosts callbacks and SMSF calls may reach: host names, .domain suffixes, CIDR blocks, addresses. Empty: none (unless allowAny). Loopback, link-local and multicast addresses only when listed by address.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true }
+              "description": "Hosts callbacks and SMSF calls may reach: host names, .domain suffixes, CIDR blocks, addresses. Empty: none (unless allowAny). Loopback, link-local and multicast addresses only when listed by address."
             },
             "allowAny": {
               "type": "boolean",
-              "description": "Allow callbacks and SMSF calls to any host but loopback, link-local, unspecified and multicast addresses. A high-risk security change.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+              "description": "Allow callbacks and SMSF calls to any host but loopback, link-local, unspecified and multicast addresses. A high-risk security change."
             }
           }
         },
-        "ota": {
+        "sms": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Opens the SMS (OTA) surfaces: serving-SMSF lookup and Nsmsf SendSMS. Needs config.nats.url: the stream OTA_OUTBOUND is on the applications' NATS, not on the bundled one.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "medium" }
+              "description": "Opens the SMS surfaces: serving-SMSF lookup and Nsmsf MtForwardSm. Needs config.nats.url: a NATS with JetStream, not the bundled one."
             },
             "resolverFile": { "type": "string" },
-            "uecmTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" }
+            "uecmTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+            "stream": {
+              "type": "string",
+              "pattern": "^[^\\s.*>/\\\\]{1,255}$",
+              "description": "The stream created for the SMS when no stream captures sbi.outbound.nsmsf.send.request."
+            },
+            "deliveryEventSubject": {
+              "type": "string",
+              "pattern": "^[^\\s.*>]+(\\.[^\\s.*>]+)*$",
+              "description": "The subject each SMS's DeliveryEvent goes to."
+            }
           }
         },
         "audit": {
@@ -383,13 +447,11 @@
           "properties": {
             "disabled": {
               "type": "boolean",
-              "description": "Audit kill switch. Disabling audit is high-risk / approval-gated.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+              "description": "Audit kill switch. Disabling audit is high-risk / approval-gated."
             },
             "natsSubject": {
               "type": "string",
-              "description": "Audit event subject; tenant-prefixable for multi-tenant clusters.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": false, "tenantScoped": true, "riskClass": "medium" }
+              "description": "Audit event subject; tenant-prefixable for multi-tenant clusters."
             }
           }
         }
@@ -399,7 +461,7 @@
     "extraVolumes": {
       "type": "array",
       "items": { "type": "object" },
-      "description": "Further pod volumes, for files the gateway reads by path (outbound TLS, JWKS file, OTA resolver): usually a Secret or a ConfigMap."
+      "description": "Further pod volumes, for files the gateway reads by path (outbound TLS, JWKS file, SMS resolver): usually a Secret or a ConfigMap."
     },
     "extraVolumeMounts": {
       "type": "array",
@@ -412,8 +474,7 @@
       "description": "Ingress to the gateway pods: the SBI port from sbiFrom (empty: anywhere); the admin port (its token and TLS: config.admin) from pods in the release namespace and adminFrom.",
       "properties": {
         "enabled": {
-          "type": "boolean",
-          "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true }
+          "type": "boolean"
         },
         "sbiFrom": { "type": "array", "items": { "type": "object" }, "description": "NetworkPolicyPeer entries allowed to reach the SBI port; empty: anywhere." },
         "adminFrom": { "type": "array", "items": { "type": "object" }, "description": "NetworkPolicyPeer entries allowed to reach the admin port besides the release namespace, e.g. Prometheus." }
@@ -427,8 +488,7 @@
       "properties": {
         "existingSecret": {
           "type": "string",
-          "description": "Name of a pre-created Secret (tls.crt/tls.key/ca.crt). Empty ⇒ h2c.",
-          "x-arinna": { "userExposed": false, "secretRef": true, "requiresApproval": true, "riskClass": "high" }
+          "description": "Name of a pre-created Secret (tls.crt/tls.key/ca.crt). Empty ⇒ h2c."
         },
         "mountPath": { "type": "string" }
       }
@@ -441,8 +501,7 @@
       "properties": {
         "deploy": {
           "type": "boolean",
-          "description": "Deploy the bundled NATS when config.nats.url is empty. False: config.nats.url is required.",
-          "x-arinna": { "userExposed": false, "mutableAtRuntime": false, "riskClass": "medium" }
+          "description": "Deploy the bundled NATS when config.nats.url is empty. False: config.nats.url is required."
         },
         "image": { "type": "string", "minLength": 1 },
         "resources": {
@@ -465,12 +524,10 @@
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Render a Prometheus Operator ServiceMonitor for the admin port's /metrics (admin token and TLS included).",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+              "description": "Render a Prometheus Operator ServiceMonitor for the admin port's /metrics (admin token and TLS included)."
             },
             "interval": {
-              "type": "string", "pattern": "^[1-9][0-9]*(s|m)$",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+              "type": "string", "pattern": "^[1-9][0-9]*(s|m)$"
             },
             "labels": { "type": "object", "additionalProperties": { "type": "string" } },
             "tlsConfig": { "type": "object", "description": "The ServiceMonitor endpoint's tlsConfig, with config.admin.tls." }
@@ -482,17 +539,14 @@
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Render a PrometheusRule with the gateway's alerts; they select the series the chart's ServiceMonitor scrapes.",
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+              "description": "Render a PrometheusRule with the gateway's alerts; they select the series the chart's ServiceMonitor scrapes."
             },
             "labels": { "type": "object", "additionalProperties": { "type": "string" } },
             "errorRatio": {
-              "type": "number", "exclusiveMinimum": 0, "maximum": 1,
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+              "type": "number", "exclusiveMinimum": 0, "maximum": 1
             },
             "certificateExpiryDays": {
-              "type": "integer", "minimum": 1,
-              "x-arinna": { "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" }
+              "type": "integer", "minimum": 1
             }
           }
         }

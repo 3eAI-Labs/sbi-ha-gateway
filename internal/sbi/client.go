@@ -17,9 +17,11 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -100,7 +102,38 @@ func DefaultAmfClientConfig() AmfClientConfig {
 // AmfClient sends callbacks to 5G Core NFs
 type AmfClient struct {
 	Client *http.Client
+
+	// Tokens gives the access tokens of the calls made with an Access; nil: none is sent.
+	Tokens Tokens
+
+	// asked holds the producers ("scheme://host:port") that answered a call with an Access
+	// 401: their calls carry a token from then on. Only producers the destinations allow
+	// answer, so it grows with them.
+	asked sync.Map
 }
+
+// Tokens gives OAuth2 access tokens from the NRF (TS 29.510 clause 5.4.2.2).
+type Tokens interface {
+	// Token returns a token to scope at producers of NF type targetType, or at the
+	// instance targetInstance alone when it is not empty.
+	Token(ctx context.Context, scope, targetType, targetInstance string) (string, error)
+	// Refused forgets token, which a producer refused.
+	Refused(scope, targetType, targetInstance, token string)
+}
+
+// Access is the authorization a call may need (TS 29.500 clause 6.7.3): the API's OAuth2
+// scope, e.g. nsmsf-sms, its producer's NF type, e.g. SMSF, and the producer's NF instance
+// ID when the caller knows it (from discovery), which the token is then asked for. The zero
+// Access: the call never carries a token.
+type Access struct {
+	Scope              string
+	TargetNfType       string
+	TargetNfInstanceId string
+}
+
+// ErrNoAccessToken: a producer answered 401 and the NRF gave no token to send it. Transient:
+// the NRF may give one later.
+var ErrNoAccessToken = errors.New("sbi: HTTP 401, and no access token")
 
 // NewAmfClient creates a new client with default configuration (no mTLS,
 // h2c only). Production deployments should use NewAmfClientWithConfig and
@@ -199,15 +232,9 @@ func (c *AmfClient) SendCallback(ctx context.Context, uri string, payload interf
 		return fmt.Errorf("marshal failed: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, bytes.NewBuffer(body))
+	resp, err := c.post(ctx, uri, "application/json", body, Access{})
 	if err != nil {
-		return fmt.Errorf("create request failed: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.Client.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -238,8 +265,9 @@ type Multipart struct {
 // PostMultipart POSTs m to uri as multipart/related and returns the response's parts: a
 // 2xx with a multipart/related body is parsed into a Multipart (JSON part first, the binary
 // part found by any other content type), a 2xx with another body gives its bytes as JSON.
-// Errors are as SendCallback's: *HTTPError for >= 400, a plain error for transport failures.
-func (c *AmfClient) PostMultipart(ctx context.Context, uri string, m Multipart) (*Multipart, error) {
+// Errors are as SendCallback's: *HTTPError for >= 400, a plain error for transport failures;
+// ErrNoAccessToken when the producer asks for a token and the NRF gives none.
+func (c *AmfClient) PostMultipart(ctx context.Context, uri string, m Multipart, a Access) (*Multipart, error) {
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
 	jsonPart, err := w.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/json"}})
@@ -263,16 +291,10 @@ func (c *AmfClient) PostMultipart(ctx context.Context, uri string, m Multipart) 
 		return nil, fmt.Errorf("build multipart: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &body)
+	resp, err := c.post(ctx, uri, mime.FormatMediaType("multipart/related",
+		map[string]string{"boundary": w.Boundary(), "type": "application/json"}), body.Bytes(), a)
 	if err != nil {
-		return nil, fmt.Errorf("create request failed: %w", err)
-	}
-	req.Header.Set("Content-Type", mime.FormatMediaType("multipart/related",
-		map[string]string{"boundary": w.Boundary(), "type": "application/json"}))
-
-	resp, err := c.Client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
@@ -288,6 +310,58 @@ func (c *AmfClient) PostMultipart(ctx context.Context, uri string, m Multipart) 
 		return &Multipart{JSON: data}, nil
 	}
 	return parseMultipart(data, params["boundary"])
+}
+
+// post POSTs body to uri. With an Access and Tokens, the call carries a token once its
+// producer has answered one 401 (the API admits calls with and without one, so the producer
+// decides), and a 401 is answered with a fresh token, once: the producer asks for one, or
+// refused the one sent. Over https only: the URI comes from a NATS message, and a token
+// names the producer's NF type, or one instance when discovery found it, so a token seen in
+// cleartext would be accepted by any producer of that type, or by that one. A 401 over http
+// is the producer's answer.
+func (c *AmfClient) post(ctx context.Context, uri, contentType string, body []byte, a Access) (*http.Response, error) {
+	u, err := url.Parse(uri)
+	if c.Tokens == nil || a.Scope == "" || err != nil || u.Scheme != "https" {
+		return c.send(ctx, uri, contentType, body, "")
+	}
+	producer := u.Scheme + "://" + u.Host
+	var token string
+	var tokenErr error
+	if _, ok := c.asked.Load(producer); ok {
+		// Without one the call still goes: the producer may no longer ask for it.
+		token, tokenErr = c.Tokens.Token(ctx, a.Scope, a.TargetNfType, a.TargetNfInstanceId)
+	}
+	resp, err := c.send(ctx, uri, contentType, body, token)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+	_ = resp.Body.Close()
+	c.asked.Store(producer, true)
+	if tokenErr == nil {
+		if token != "" {
+			c.Tokens.Refused(a.Scope, a.TargetNfType, a.TargetNfInstanceId, token)
+		}
+		if token, tokenErr = c.Tokens.Token(ctx, a.Scope, a.TargetNfType, a.TargetNfInstanceId); tokenErr == nil {
+			return c.send(ctx, uri, contentType, body, token)
+		}
+	}
+	return nil, fmt.Errorf("%w: %w", ErrNoAccessToken, tokenErr)
+}
+
+func (c *AmfClient) send(ctx context.Context, uri, contentType string, body []byte, token string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	return resp, nil
 }
 
 // parseMultipart reads a multipart/related body: its first part is the JSON root, and the

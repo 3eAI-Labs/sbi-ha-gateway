@@ -50,7 +50,7 @@ spec:
           annotations:
             summary: "Notifications were not delivered (reported on 5g.data.notify.failed)"
         - alert: SbiGatewaySmsRetriesExhausted
-          expr: sum(increase(sbi_gateway_ota_smsf_sends_total{ {{ $s }}, result="retries_exhausted"}[10m])) > 0
+          expr: sum(increase(sbi_gateway_sms_smsf_sends_total{ {{ $s }}, result="retries_exhausted"}[10m])) > 0
           labels: {severity: warning}
           annotations:
             summary: "MT SMS failed after every delivery: the SMSF failed transiently"
@@ -64,6 +64,39 @@ spec:
           labels: {severity: warning}
           annotations:
             summary: "A NATS subscription fell behind and lost messages"
+        - alert: SbiGatewayNotRegisteredWithNRF
+          # No pod holds the profile registered: NFs that discover through the NRF cannot find it.
+          expr: max by (nf_type) (sbi_gateway_nrf_registered{ {{ $s }} }) == 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "No sbi-ha-gateway pod holds the {{ "{{ $labels.nf_type }}" }} profile registered with the NRF"
+        - alert: SbiGatewayNRFUnreachable
+          # One pod's registration or heartbeats fail and none succeeds; the others may still hold it.
+          # An access token the NRF issues is no success: the heartbeat it goes with may still fail.
+          # Nor is a registration while heartbeats fail: the gateway registers again, from time to
+          # time, an instance whose heartbeats the NRF refuses for want of a token. A failed
+          # discovery is SbiGatewayNRFDiscoveryFailing's, a failed subscription
+          # SbiGatewayNRFSubscriptionFailing's: an NRF may refuse what it answers.
+          expr: (sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, result!~"2..", operation!~"discover|subscribe|subscription_update|unsubscribe"}[10m])) > 0) unless ((sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, result=~"2..", operation="heartbeat"}[10m])) > 0) or ((sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, result=~"2..", operation!~"heartbeat|token"}[10m])) > 0) unless (sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, result!~"2..", operation="heartbeat"}[10m])) > 0)))
+          labels: {severity: warning}
+          annotations:
+            summary: "sbi-ha-gateway {{ "{{ $labels.instance }}" }} has not reached the NRF for its {{ "{{ $labels.nf_type }}" }} profile in 10 minutes"
+        - alert: SbiGatewayNRFDiscoveryFailing
+          # One pod's discoveries of the SMSFs fail and none succeeds: the MT SMS that name their
+          # SMSF by instance ID are pending or failed (DISCOVERY_FAILED).
+          expr: (sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, operation="discover", result!~"2.."}[10m])) > 0) unless (sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, operation="discover", result=~"2.."}[10m])) > 0)
+          labels: {severity: warning}
+          annotations:
+            summary: "sbi-ha-gateway {{ "{{ $labels.instance }}" }} has not discovered an SMSF through the NRF, as {{ "{{ $labels.nf_type }}" }}, in 10 minutes"
+        - alert: SbiGatewayNRFSubscriptionFailing
+          # One pod's subscriptions to the SMSFs it discovered fail and none succeeds: their
+          # deregistration or profile change goes unnoticed until the validityPeriod ends.
+          # A removal that fails is not counted: the subscription lapses at its validity time.
+          expr: (sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, operation=~"subscribe|subscription_update", result!~"2.."}[10m])) > 0) unless (sum by (instance, nf_type) (increase(sbi_gateway_nrf_requests_total{ {{ $s }}, operation=~"subscribe|subscription_update", result=~"2.."}[10m])) > 0)
+          labels: {severity: warning}
+          annotations:
+            summary: "sbi-ha-gateway {{ "{{ $labels.instance }}" }} has not subscribed to an SMSF at the NRF, as {{ "{{ $labels.nf_type }}" }}, in 10 minutes"
         - alert: SbiGatewayCertificateExpiry
           expr: sbi_gateway_tls_certificate_expiry_timestamp_seconds{ {{ $s }} } - time() < {{ .Values.metrics.prometheusRule.certificateExpiryDays }} * 86400
           labels: {severity: warning}

@@ -3,7 +3,10 @@
 
 package oauth
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // publicPaths bypasses scope enforcement entirely. Keep this list minimal —
 // every entry is an explicit decision to skip OAuth2 authZ. The SBI port
@@ -13,6 +16,13 @@ var publicPaths = map[string]struct{}{
 	"/livez":  {},
 	"/readyz": {},
 }
+
+// nrfNotifyPath bypasses it too: the callback URIs of the gateway's subscriptions with the
+// NRF (nrf.NotifyPath: /nrf-notify/v1/{replica}/{key}), matched whole so that no other path
+// shares the exemption. The callback's OpenAPI states no security, and the NRF sends no token
+// the gateway could verify (free5GC's is for the NF type, with no scope); the 128-bit key in
+// the URI guards it, and a notification only makes the gateway ask the NRF again.
+var nrfNotifyPath = regexp.MustCompile(`^/nrf-notify/v1/[0-9a-f]{32}/[0-9a-f]{32}$`)
 
 // RequiredScope returns the OAuth2 scope name a caller's token MUST contain to
 // reach urlPath. It is derived from the URL prefix per 3GPP TS 29.501 §4.4.1
@@ -30,7 +40,7 @@ var publicPaths = map[string]struct{}{
 // path itself which will never match an issued token, so the request is
 // rejected.
 func RequiredScope(urlPath string) string {
-	if _, public := publicPaths[urlPath]; public {
+	if _, public := publicPaths[urlPath]; public || nrfNotifyPath.MatchString(urlPath) {
 		return ""
 	}
 	trimmed := strings.TrimPrefix(urlPath, "/")

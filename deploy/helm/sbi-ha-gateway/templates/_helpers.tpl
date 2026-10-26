@@ -103,3 +103,49 @@ Without tls.existingSecret only a trial install gets here (deployment.yaml fails
 {{- define "sbi-ha-gateway.adminTLS" -}}
 {{- if and .Values.config.admin.tls .Values.tls.existingSecret }}true{{ end -}}
 {{- end -}}
+
+{{/*
+NRF registration (config.nrf): on when apiRoot is set. The profiles file is what
+NRF_PROFILES_FILE points at; nrfCheck stops a render the gateway would refuse at start.
+*/}}
+{{- define "sbi-ha-gateway.nrfEnabled" -}}
+{{- if .Values.config.nrf.apiRoot }}true{{ end }}
+{{- end }}
+
+{{- define "sbi-ha-gateway.nrfProfiles" -}}
+{{- dict "profiles" .Values.config.nrf.profiles | toPrettyJson }}
+{{- end }}
+
+{{- define "sbi-ha-gateway.nrfCheck" -}}
+{{- with .Values.config.nrf }}
+{{- if and .apiRoot (not .profiles) }}
+{{- fail "config.nrf.apiRoot needs config.nrf.profiles: the NF profiles to register" }}
+{{- end }}
+{{- if and .profiles (not .apiRoot) }}
+{{- fail "config.nrf.profiles needs config.nrf.apiRoot: the NRF to register them with" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/* Environment the gateway and the deregistration Job share: the NRF and the outbound TLS. */}}
+{{- define "sbi-ha-gateway.nrfEnv" -}}
+- name: NRF_API_ROOT
+  value: {{ .Values.config.nrf.apiRoot | quote }}
+- name: NRF_PROFILES_FILE
+  value: "/etc/sbi-gateway/nrf/profiles.json"
+{{- with .Values.config.nrf.heartbeatTimer }}
+- name: NRF_HEARTBEAT_TIMER
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+
+{{- define "sbi-ha-gateway.outboundTLSEnv" -}}
+{{- with .Values.config.mtls }}
+{{- range $env, $path := dict "MTLS_OUTBOUND_CERT_FILE" .outboundCertFile "MTLS_OUTBOUND_KEY_FILE" .outboundKeyFile "MTLS_OUTBOUND_CA_FILE" .outboundCAFile }}
+{{- if $path }}
+- name: {{ $env }}
+  value: {{ $path | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

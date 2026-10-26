@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -219,6 +220,34 @@ func TestValidator_RejectsWrongAudience(t *testing.T) {
 
 	_, err := v.Validate(context.Background(), tok, nil)
 	mustReason(t, err, ReasonWrongAudience)
+}
+
+// One audience per registered NF profile (the UDM's and the UDR's instance IDs): a token
+// for either is accepted, any other is not.
+func TestValidator_AudienceList(t *testing.T) {
+	iss := newRSAIssuer(t, "k1")
+	v := newFileValidator(t, iss.publicSet, " udm-id , udr-id,")
+	for _, aud := range []string{"udm-id", "udr-id"} {
+		tok := iss.sign(t, tokenOpts{sub: "AMF-1", aud: aud, scope: "nudm-sdm"})
+		if _, err := v.Validate(context.Background(), tok, nil); err != nil {
+			t.Fatalf("aud %q: %v", aud, err)
+		}
+	}
+	tok := iss.sign(t, tokenOpts{sub: "AMF-1", aud: "udm-id,udr-id", scope: "nudm-sdm"})
+	_, err := v.Validate(context.Background(), tok, nil)
+	mustReason(t, err, ReasonWrongAudience)
+	tok = iss.sign(t, tokenOpts{sub: "AMF-1", skipAud: true, scope: "nudm-sdm"})
+	_, err = v.Validate(context.Background(), tok, nil)
+	mustReason(t, err, ReasonWrongAudience)
+}
+
+func TestSplitAudience(t *testing.T) {
+	if got := SplitAudience(" a,,b , "); !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("SplitAudience: %q", got)
+	}
+	if got := SplitAudience(" , "); len(got) != 0 {
+		t.Fatalf("SplitAudience of blanks: %q", got)
+	}
 }
 
 func TestValidator_RejectsMissingClaim(t *testing.T) {

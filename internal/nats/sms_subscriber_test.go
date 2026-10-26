@@ -30,7 +30,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-func runOtaServer(t *testing.T) (*natsserver.Server, *gnats.Conn) {
+func runSMSServer(t *testing.T) (*natsserver.Server, *gnats.Conn) {
 	t.Helper()
 	srv, err := natsserver.NewServer(&natsserver.Options{
 		Port:      -1,
@@ -110,7 +110,7 @@ func TestBuildSmsfMtURI(t *testing.T) {
 // --- UECM request/reply ---------------------------------------------------
 
 func TestUecm_HappyPath_RepliesWithContext(t *testing.T) {
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
 
@@ -122,7 +122,7 @@ func TestUecm_HappyPath_RepliesWithContext(t *testing.T) {
 			SmsfPlmnId: "28601",
 		},
 	}
-	sub := NewOTASubscriber(conn, nil, quietLogger(), OTAConfig{
+	sub := NewSMSSubscriber(conn, nil, quietLogger(), SMSConfig{
 		Resolver: resolver,
 		Outbound: &stubOutbound{},
 	})
@@ -156,11 +156,11 @@ func TestUecm_HappyPath_RepliesWithContext(t *testing.T) {
 }
 
 func TestUecm_NotFound_RepliesNF_NOT_FOUND(t *testing.T) {
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
 
-	sub := NewOTASubscriber(conn, nil, quietLogger(), OTAConfig{
+	sub := NewSMSSubscriber(conn, nil, quietLogger(), SMSConfig{
 		Resolver: uecm.NewEmpty(), // production default — always NF_NOT_FOUND
 		Outbound: &stubOutbound{},
 	})
@@ -188,11 +188,11 @@ func TestUecm_NotFound_RepliesNF_NOT_FOUND(t *testing.T) {
 }
 
 func TestUecm_UnsupportedOp_Replies400(t *testing.T) {
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
 
-	sub := NewOTASubscriber(conn, nil, quietLogger(), OTAConfig{
+	sub := NewSMSSubscriber(conn, nil, quietLogger(), SMSConfig{
 		Resolver: uecm.NewEmpty(),
 		Outbound: &stubOutbound{},
 	})
@@ -216,13 +216,13 @@ func TestUecm_UnsupportedOp_Replies400(t *testing.T) {
 }
 
 func TestUecm_MalformedRequest_NoReply(t *testing.T) {
-	// Garbage payload → no reply → OTA's probe budget expires and falls
+	// Garbage payload → no reply → the platform's probe budget expires and it falls
 	// back to Diameter. Asserting "no reply within 200ms" is the contract.
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
 
-	sub := NewOTASubscriber(conn, nil, quietLogger(), OTAConfig{
+	sub := NewSMSSubscriber(conn, nil, quietLogger(), SMSConfig{
 		Resolver: uecm.NewEmpty(),
 		Outbound: &stubOutbound{},
 	})
@@ -237,9 +237,9 @@ func TestUecm_MalformedRequest_NoReply(t *testing.T) {
 
 // --- SMSF SendSMS (JetStream) --------------------------------------------
 
-// setupOtaStream creates the JetStream stream the OTA team owns in
+// setupSMSStream creates the JetStream stream an SMS platform may own in
 // production. Required so our consumer has something to bind to in tests.
-func setupOtaStream(t *testing.T, conn *gnats.Conn) {
+func setupSMSStream(t *testing.T, conn *gnats.Conn) {
 	t.Helper()
 	c := &Client{conn: conn}
 	js, err := c.JetStream()
@@ -249,10 +249,10 @@ func setupOtaStream(t *testing.T, conn *gnats.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
-		Name: otaStreamName,
+		Name: sbiclient.StreamSmsfSend,
 		Subjects: []string{
 			"sbi.outbound.nsmsf.>",
-			"ota.delivery.>",
+			"sbi.nsmsf.delivery.>",
 		},
 		Retention: jetstream.WorkQueuePolicy,
 	})
@@ -266,7 +266,7 @@ func setupOtaStream(t *testing.T, conn *gnats.Conn) {
 var testRPData = []byte{0x01, 0x07, 0x04, 0x91, 0x09, 0x55, 0xf1, 0x00, 0x04, 0x04, 0x0a, 0x0b, 0x0c}
 
 func rpDataMessage(smsfURL string) []byte {
-	body, _ := json.Marshal(SbiOtaMessage{
+	body, _ := json.Marshal(SmsMessage{
 		Header:   SbiHeader{Service: "Nsmsf_SMService", Operation: "MtForwardSm", Version: "v2"},
 		Routing:  SbiRouting{Supi: "imsi-001", SmsfFqdn: smsfURL},
 		Payload:  SS7PayloadView{Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString(testRPData)},
@@ -279,26 +279,45 @@ func rpDataMessage(smsfURL string) []byte {
 // returns the DeliveryEvent the gateway publishes.
 func sendThroughSmsf(t *testing.T, smsf http.Handler, message func(smsfURL string) []byte) DeliveryEvent {
 	t.Helper()
-	srv, conn := runOtaServer(t)
+	return sendThroughSmsfWith(t, nil, nil, smsf, message)
+}
+
+// sendThroughSmsfWith is sendThroughSmsf with the access tokens of the gateway's SMS-GMSC,
+// and then an SMSF served over https: tokens go over TLS alone; and with the discovery
+// discovery gives for the SMSF's URL, when it is not nil.
+func sendThroughSmsfWith(t *testing.T, tokens sbi.Tokens, discovery func(smsfURL string) Discovery, smsf http.Handler,
+	message func(smsfURL string) []byte) DeliveryEvent {
+	t.Helper()
+	srv, conn := runSMSServer(t)
 	t.Cleanup(srv.Shutdown)
 	t.Cleanup(conn.Close)
-	setupOtaStream(t, conn)
-	httpServer := httptest.NewServer(smsf)
-	t.Cleanup(httpServer.Close)
-
+	setupSMSStream(t, conn)
 	amf := sbi.NewAmfClient()
-	amf.Client.Transport = http.DefaultTransport
+	var httpServer *httptest.Server
+	if tokens != nil {
+		httpServer = httptest.NewTLSServer(smsf)
+		amf.Client.Transport = httpServer.Client().Transport
+	} else {
+		httpServer = httptest.NewServer(smsf)
+		amf.Client.Transport = http.DefaultTransport
+	}
+	t.Cleanup(httpServer.Close)
+	amf.Tokens = tokens
 	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
 	c := &Client{conn: conn}
 	js, _ := c.JetStream()
-	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	cfg := SMSConfig{Resolver: uecm.NewEmpty(), Outbound: out}
+	if discovery != nil {
+		cfg.Discovery = discovery(httpServer.URL)
+	}
+	sub := NewSMSSubscriber(conn, js, quietLogger(), cfg)
 	if err := sub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sub.Stop(context.Background()) })
 
 	deliveries := make(chan DeliveryEvent, 1)
-	if _, err := conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+	if _, err := conn.Subscribe(sbiclient.SubjectDeliveryEvent, func(msg *gnats.Msg) {
 		var ev DeliveryEvent
 		_ = json.Unmarshal(msg.Data, &ev)
 		deliveries <- ev
@@ -363,7 +382,7 @@ func smsfAnswering(t *testing.T, report []byte) http.HandlerFunc {
 }
 
 // The SMS reaches the SMSF as MtForwardSm with the RP-DATA unchanged; the mobile station's
-// RP-ACK (MTI 010) makes it delivered, and the report reaches OTA.
+// RP-ACK (MTI 010) makes it delivered, and the report reaches the platform.
 func TestSmsf_MtForwardSm_Delivered(t *testing.T) {
 	ack := []byte{0x02, 0x07}
 	ev := sendThroughSmsf(t, smsfAnswering(t, ack), rpDataMessage)
@@ -372,6 +391,146 @@ func TestSmsf_MtForwardSm_Delivered(t *testing.T) {
 	}
 	if ev.BearerMeta["deliveryReport"] != base64.StdEncoding.EncodeToString(ack) {
 		t.Errorf("deliveryReport %q", ev.BearerMeta["deliveryReport"])
+	}
+}
+
+// smsTokens is the NRF giving the SMS-GMSC's token for nsmsf-sms at SMSFs, or failing with err.
+type smsTokens struct{ err error }
+
+func (s smsTokens) Token(_ context.Context, scope, target, instance string) (string, error) {
+	if s.err != nil {
+		return "", s.err
+	}
+	if instance != "" {
+		return "token-" + scope + "-" + instance, nil
+	}
+	return "token-" + scope + "-" + target, nil
+}
+
+func (smsTokens) Refused(_, _, _, _ string) {}
+
+// requireToken answers 401 to a MtForwardSm without the SMS-GMSC's token, as an SMSF with
+// OAuth2 does (TS 29.500 clause 6.7.3), and passes the others to next.
+func requireToken(next http.Handler) http.HandlerFunc {
+	return requireBearer("token-nsmsf-sms-SMSF", next)
+}
+
+// requireBearer is requireToken with the token the SMSF accepts.
+func requireBearer(token string, next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+// An SMSF that asks for an access token gets the SMS-GMSC's, and the SMS is delivered.
+func TestSmsf_MtForwardSm_AccessToken(t *testing.T) {
+	ev := sendThroughSmsfWith(t, smsTokens{}, nil, requireToken(smsfAnswering(t, []byte{0x02, 0x07})), rpDataMessage)
+	if ev.Status != "DELIVERED" || ev.Cause != "RP_ACK" {
+		t.Errorf("event %+v, want DELIVERED/RP_ACK", ev)
+	}
+}
+
+// When the NRF gives no token the SMSF asks for, the SMS is pending: redelivered, as the NRF
+// may give one later.
+func TestSmsf_MtForwardSm_NoAccessToken(t *testing.T) {
+	ev := sendThroughSmsfWith(t, smsTokens{err: errors.New("NRF unreachable")}, nil, requireToken(smsfAnswering(t, nil)), rpDataMessage)
+	if ev.Status != "PENDING" || ev.Cause != "NO_ACCESS_TOKEN" {
+		t.Errorf("event %+v, want PENDING/NO_ACCESS_TOKEN", ev)
+	}
+}
+
+const smsfID = "6b2f9c1e-4d3a-4f7b-8e5c-2a9d1f0b3c4e"
+
+var errUnknownSMSF = errors.New("no such SMSF")
+
+// smsfDiscovery is the NRF knowing the SMSF smsfID at root, or failing with err, transient
+// or not.
+type smsfDiscovery struct {
+	root      string
+	err       error
+	transient bool
+}
+
+func (d smsfDiscovery) ServiceRoot(_ context.Context, nfType, instanceID, service, version string) (string, error) {
+	if d.err != nil {
+		return "", d.err
+	}
+	if nfType != "SMSF" || instanceID != smsfID || service != "nsmsf-sms" || version != "v2" {
+		return "", errUnknownSMSF
+	}
+	return d.root, nil
+}
+
+func (smsfDiscovery) Unknown(err error) bool     { return errors.Is(err, errUnknownSMSF) }
+func (d smsfDiscovery) Transient(err error) bool { return d.transient }
+
+func discovering(d smsfDiscovery) func(string) Discovery {
+	return func(smsfURL string) Discovery {
+		if d.root == "" {
+			d.root = smsfURL
+		}
+		return d
+	}
+}
+
+// instanceMessage is rpDataMessage naming the SMSF by instance ID, and by fqdn when not "".
+func instanceMessage(id, fqdn string) func(string) []byte {
+	return func(string) []byte {
+		body, _ := json.Marshal(SmsMessage{
+			Header:   SbiHeader{Service: "Nsmsf_SMService", Operation: "MtForwardSm", Version: "v2"},
+			Routing:  SbiRouting{Supi: "imsi-001", SmsfInstanceId: id, SmsfFqdn: fqdn},
+			Payload:  SS7PayloadView{Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString(testRPData)},
+			Metadata: map[string]string{"tx_id": "tx-abc"},
+		})
+		return body
+	}
+}
+
+// An SMSF named by instance ID is found with discovery, and its token is for it alone.
+func TestSmsf_MtForwardSm_Discovered(t *testing.T) {
+	ev := sendThroughSmsfWith(t, smsTokens{}, discovering(smsfDiscovery{}),
+		requireBearer("token-nsmsf-sms-"+smsfID, smsfAnswering(t, []byte{0x02, 0x07})), instanceMessage(smsfID, ""))
+	if ev.Status != "DELIVERED" || ev.Cause != "RP_ACK" || ev.BearerMeta["smsfInstanceId"] != smsfID {
+		t.Errorf("event %+v, want DELIVERED/RP_ACK for %s", ev, smsfID)
+	}
+}
+
+// What discovery answers decides the SMS when it finds no SMSF.
+func TestSmsf_MtForwardSm_NotDiscovered(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		d             smsfDiscovery
+		id            string
+		status, cause string
+	}{
+		{"unknown SMSF", smsfDiscovery{}, "00000000-0000-4000-8000-000000000000", "FAILED", "SMSF_NOT_FOUND"},
+		{"NRF unreachable", smsfDiscovery{err: errors.New("dial"), transient: true}, smsfID, "PENDING", "DISCOVERY_FAILED"},
+		{"NRF refuses", smsfDiscovery{err: errors.New("HTTP 400")}, smsfID, "FAILED", "DISCOVERY_FAILED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := sendThroughSmsfWith(t, nil, discovering(tc.d), smsfAnswering(t, nil), instanceMessage(tc.id, ""))
+			if ev.Status != tc.status || ev.Cause != tc.cause {
+				t.Errorf("event %+v, want %s/%s", ev, tc.status, tc.cause)
+			}
+		})
+	}
+}
+
+// Without discovery an instance ID is not enough: the SMS goes to the FQDN, or fails.
+func TestSmsf_MtForwardSm_InstanceWithoutDiscovery(t *testing.T) {
+	ev := sendThroughSmsf(t, smsfAnswering(t, nil), instanceMessage(smsfID, ""))
+	if ev.Status != "FAILED" || ev.Cause != "INVALID_ROUTING" {
+		t.Errorf("event %+v, want FAILED/INVALID_ROUTING", ev)
+	}
+	ev = sendThroughSmsf(t, smsfAnswering(t, []byte{0x02, 0x07}), func(smsfURL string) []byte {
+		return instanceMessage(smsfID, smsfURL)(smsfURL)
+	})
+	if ev.Status != "DELIVERED" {
+		t.Errorf("event %+v, want DELIVERED through the FQDN", ev)
 	}
 }
 
@@ -404,7 +563,7 @@ func TestSmsf_PayloadNotRPData(t *testing.T) {
 			called := false
 			ev := sendThroughSmsf(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }),
 				func(smsfURL string) []byte {
-					body, _ := json.Marshal(SbiOtaMessage{
+					body, _ := json.Marshal(SmsMessage{
 						Header:  SbiHeader{Service: "Nsmsf_SMService", Operation: "MtForwardSm"},
 						Routing: SbiRouting{Supi: "imsi-001", SmsfFqdn: smsfURL},
 						Payload: payload,
@@ -418,14 +577,14 @@ func TestSmsf_PayloadNotRPData(t *testing.T) {
 	}
 }
 
-// An SMSF that keeps failing transiently gets otaMaxDeliver attempts. OTA sees PENDING for
+// An SMSF that keeps failing transiently gets smsMaxDeliver attempts. The platform sees PENDING for
 // each but the last, then FAILED RETRIES_EXHAUSTED with the transient cause, and the work
 // queue no longer holds the SMS.
 func TestSmsf_RetriesExhausted(t *testing.T) {
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
-	setupOtaStream(t, conn)
+	setupSMSStream(t, conn)
 
 	var calls atomic.Int32
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -439,15 +598,15 @@ func TestSmsf_RetriesExhausted(t *testing.T) {
 	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
 	c := &Client{conn: conn}
 	js, _ := c.JetStream()
-	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	sub := NewSMSSubscriber(conn, js, quietLogger(), SMSConfig{Resolver: uecm.NewEmpty(), Outbound: out})
 	sub.nakDelay = 10 * time.Millisecond
 	if err := sub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sub.Stop(context.Background()) }()
 
-	deliveries := make(chan DeliveryEvent, otaMaxDeliver+1)
-	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+	deliveries := make(chan DeliveryEvent, smsMaxDeliver+1)
+	_, _ = conn.Subscribe(sbiclient.SubjectDeliveryEvent, func(msg *gnats.Msg) {
 		var ev DeliveryEvent
 		_ = json.Unmarshal(msg.Data, &ev)
 		deliveries <- ev
@@ -456,13 +615,13 @@ func TestSmsf_RetriesExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 1; i <= otaMaxDeliver; i++ {
+	for i := 1; i <= smsMaxDeliver; i++ {
 		select {
 		case ev := <-deliveries:
-			if i < otaMaxDeliver && (ev.Status != "PENDING" || ev.Cause != "HTTP_503") {
+			if i < smsMaxDeliver && (ev.Status != "PENDING" || ev.Cause != "HTTP_503") {
 				t.Errorf("event %d: %+v, want PENDING/HTTP_503", i, ev)
 			}
-			if i == otaMaxDeliver && (ev.Status != "FAILED" || ev.Cause != "RETRIES_EXHAUSTED" ||
+			if i == smsMaxDeliver && (ev.Status != "FAILED" || ev.Cause != "RETRIES_EXHAUSTED" ||
 				ev.BearerMeta["lastCause"] != "HTTP_503" || ev.TransactionID != "tx-abc") {
 				t.Errorf("last event: %+v, want FAILED/RETRIES_EXHAUSTED, lastCause HTTP_503", ev)
 			}
@@ -475,10 +634,10 @@ func TestSmsf_RetriesExhausted(t *testing.T) {
 		t.Errorf("event after the last delivery: %+v", ev)
 	case <-time.After(300 * time.Millisecond):
 	}
-	if n := calls.Load(); n != otaMaxDeliver {
-		t.Errorf("SMSF called %d times, want %d", n, otaMaxDeliver)
+	if n := calls.Load(); n != smsMaxDeliver {
+		t.Errorf("SMSF called %d times, want %d", n, smsMaxDeliver)
 	}
-	stream, err := js.Stream(context.Background(), otaStreamName)
+	stream, err := js.Stream(context.Background(), sbiclient.StreamSmsfSend)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,10 +651,10 @@ func TestSmsf_RetriesExhausted(t *testing.T) {
 }
 
 func TestSmsf_4xxFromSmsf_FailsPermanently(t *testing.T) {
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
-	setupOtaStream(t, conn)
+	setupSMSStream(t, conn)
 
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -509,7 +668,7 @@ func TestSmsf_4xxFromSmsf_FailsPermanently(t *testing.T) {
 	c := &Client{conn: conn}
 	js, _ := c.JetStream()
 
-	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{
+	sub := NewSMSSubscriber(conn, js, quietLogger(), SMSConfig{
 		Resolver: uecm.NewEmpty(),
 		Outbound: out,
 	})
@@ -517,13 +676,13 @@ func TestSmsf_4xxFromSmsf_FailsPermanently(t *testing.T) {
 	defer func() { _ = sub.Stop(context.Background()) }()
 
 	deliveries := make(chan DeliveryEvent, 1)
-	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+	_, _ = conn.Subscribe(sbiclient.SubjectDeliveryEvent, func(msg *gnats.Msg) {
 		var ev DeliveryEvent
 		_ = json.Unmarshal(msg.Data, &ev)
 		deliveries <- ev
 	})
 
-	body, _ := json.Marshal(SbiOtaMessage{
+	body, _ := json.Marshal(SmsMessage{
 		Header:  SbiHeader{Service: "Nsmsf_SMService", Operation: "SendSMS", Version: "v1"},
 		Routing: SbiRouting{Supi: "imsi-001", SmsfFqdn: httpServer.URL},
 		Payload: SS7PayloadView{Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString(testRPData)},
@@ -544,17 +703,17 @@ func TestSmsf_4xxFromSmsf_FailsPermanently(t *testing.T) {
 }
 
 func TestSmsf_PeeringPending_FailsPermanently(t *testing.T) {
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
-	setupOtaStream(t, conn)
+	setupSMSStream(t, conn)
 
 	mtcIwf, _ := outbound.New(outbound.ProfileMtcIwfRest, nil)
 
 	c := &Client{conn: conn}
 	js, _ := c.JetStream()
 
-	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{
+	sub := NewSMSSubscriber(conn, js, quietLogger(), SMSConfig{
 		Resolver: uecm.NewEmpty(),
 		Outbound: mtcIwf,
 	})
@@ -562,13 +721,13 @@ func TestSmsf_PeeringPending_FailsPermanently(t *testing.T) {
 	defer func() { _ = sub.Stop(context.Background()) }()
 
 	deliveries := make(chan DeliveryEvent, 1)
-	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+	_, _ = conn.Subscribe(sbiclient.SubjectDeliveryEvent, func(msg *gnats.Msg) {
 		var ev DeliveryEvent
 		_ = json.Unmarshal(msg.Data, &ev)
 		deliveries <- ev
 	})
 
-	body, _ := json.Marshal(SbiOtaMessage{
+	body, _ := json.Marshal(SmsMessage{
 		Header:  SbiHeader{Service: "Nsmsf_SMService", Operation: "SendSMS", Version: "v1"},
 		Routing: SbiRouting{Supi: "imsi-001", SmsfFqdn: "doesnotmatter"},
 		Payload: SS7PayloadView{Encoding: sbiclient.EncodingRPData, Content: base64.StdEncoding.EncodeToString(testRPData)},
@@ -608,7 +767,7 @@ func TestMetricsResultFor(t *testing.T) {
 }
 
 // txIDFromMetadata table — same-spirit guard against silent contract drift
-// (OTA uses tx_id; tolerate the two common alternates).
+// (tx_id, or one of the two common alternates).
 func TestTxIDFromMetadata(t *testing.T) {
 	cases := []struct {
 		in   map[string]string
@@ -635,10 +794,10 @@ var _ = errors.Is
 // An SMSF that OUTBOUND_ALLOWED_DESTINATIONS does not list is never called: the SMS fails
 // permanently, without redelivery.
 func TestSmsf_DestinationNotAllowed(t *testing.T) {
-	srv, conn := runOtaServer(t)
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
-	setupOtaStream(t, conn)
+	setupSMSStream(t, conn)
 
 	called := make(chan struct{}, 1)
 	smsf := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called <- struct{}{} }))
@@ -653,14 +812,14 @@ func TestSmsf_DestinationNotAllowed(t *testing.T) {
 	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
 	c := &Client{conn: conn}
 	js, _ := c.JetStream()
-	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	sub := NewSMSSubscriber(conn, js, quietLogger(), SMSConfig{Resolver: uecm.NewEmpty(), Outbound: out})
 	if err := sub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sub.Stop(context.Background()) }()
 
 	deliveries := make(chan DeliveryEvent, 1)
-	_, _ = conn.Subscribe(subjectDeliveryEvent, func(msg *gnats.Msg) {
+	_, _ = conn.Subscribe(sbiclient.SubjectDeliveryEvent, func(msg *gnats.Msg) {
 		var ev DeliveryEvent
 		_ = json.Unmarshal(msg.Data, &ev)
 		deliveries <- ev
@@ -683,11 +842,11 @@ func TestSmsf_DestinationNotAllowed(t *testing.T) {
 
 // Stop waits for the SMS being sent, which is acknowledged: cut off, it would be sent again
 // when JetStream redelivered it.
-func TestOTASubscriber_StopWaitsForSMS(t *testing.T) {
-	srv, conn := runOtaServer(t)
+func TestSMSSubscriber_StopWaitsForSMS(t *testing.T) {
+	srv, conn := runSMSServer(t)
 	defer srv.Shutdown()
 	defer conn.Close()
-	setupOtaStream(t, conn)
+	setupSMSStream(t, conn)
 
 	inSMSF := make(chan struct{})
 	finished := make(chan struct{})
@@ -704,7 +863,7 @@ func TestOTASubscriber_StopWaitsForSMS(t *testing.T) {
 	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
 	c := &Client{conn: conn}
 	js, _ := c.JetStream()
-	sub := NewOTASubscriber(conn, js, quietLogger(), OTAConfig{Resolver: uecm.NewEmpty(), Outbound: out})
+	sub := NewSMSSubscriber(conn, js, quietLogger(), SMSConfig{Resolver: uecm.NewEmpty(), Outbound: out})
 	if err := sub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -727,12 +886,120 @@ func TestOTASubscriber_StopWaitsForSMS(t *testing.T) {
 	default:
 		t.Fatal("Stop returned while the SMS was being sent")
 	}
-	stream, _ := js.Stream(context.Background(), otaStreamName)
+	stream, _ := js.Stream(context.Background(), sbiclient.StreamSmsfSend)
 	info, err := stream.Info(context.Background(), jetstream.WithSubjectFilter(subjectSmsfRequest))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n := info.State.Subjects[subjectSmsfRequest]; n != 0 {
 		t.Errorf("work queue still holds %d SMS: not acknowledged", n)
+	}
+}
+
+// smsStreamFor starts the SMS surfaces on a JetStream server, with cfg's stream and delivery
+// events' subject, against an SMSF that delivers, and returns the event of one SMS sent and
+// the JetStream context.
+func smsStreamFor(t *testing.T, conn *gnats.Conn, cfg SMSConfig) (DeliveryEvent, jetstream.JetStream) {
+	t.Helper()
+	httpServer := httptest.NewServer(smsfAnswering(t, []byte{rpAckMSToNetwork, 7}))
+	t.Cleanup(httpServer.Close)
+	amf := sbi.NewAmfClient()
+	amf.Client.Transport = http.DefaultTransport
+	out, _ := outbound.New(outbound.ProfileSBIDirect, amf)
+	c := &Client{conn: conn}
+	js, _ := c.JetStream()
+	cfg.Resolver, cfg.Outbound = uecm.NewEmpty(), out
+	sub := NewSMSSubscriber(conn, js, quietLogger(), cfg)
+	if err := sub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Stop(context.Background()) })
+	subject := cfg.DeliveryEventSubject
+	if subject == "" {
+		subject = sbiclient.SubjectDeliveryEvent
+	}
+	deliveries := make(chan DeliveryEvent, 1)
+	if _, err := conn.Subscribe(subject, func(msg *gnats.Msg) {
+		var ev DeliveryEvent
+		_ = json.Unmarshal(msg.Data, &ev)
+		deliveries <- ev
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.Publish(context.Background(), subjectSmsfRequest, rpDataMessage(httpServer.URL)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case ev := <-deliveries:
+		return ev, js
+	case <-time.After(3 * time.Second):
+		t.Fatal("no delivery event published within 3s")
+	}
+	return DeliveryEvent{}, js
+}
+
+// Without a stream for the SMS, the gateway creates one, a work queue, and the delivery
+// events go out without JetStream: nothing else needs to exist.
+func TestSMSSubscriber_CreatesTheStream(t *testing.T) {
+	srv, conn := runSMSServer(t)
+	t.Cleanup(srv.Shutdown)
+	t.Cleanup(conn.Close)
+
+	ev, js := smsStreamFor(t, conn, SMSConfig{})
+	if ev.Status != sbiclient.DeliveryDelivered {
+		t.Errorf("status %s, want DELIVERED", ev.Status)
+	}
+	stream, err := js.Stream(context.Background(), sbiclient.StreamSmsfSend)
+	if err != nil {
+		t.Fatalf("stream %s: %v", sbiclient.StreamSmsfSend, err)
+	}
+	cfg := stream.CachedInfo().Config
+	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != subjectSmsfRequest ||
+		cfg.Retention != jetstream.WorkQueuePolicy || cfg.Replicas != 1 {
+		t.Errorf("stream subjects %v, retention %v, replicas %d", cfg.Subjects, cfg.Retention, cfg.Replicas)
+	}
+}
+
+// A stream an SMS platform created under its own name is used, and the delivery events go to
+// the subject configured, through the platform's stream when it captures it.
+func TestSMSSubscriber_PlatformStream(t *testing.T) {
+	srv, conn := runSMSServer(t)
+	t.Cleanup(srv.Shutdown)
+	t.Cleanup(conn.Close)
+	c := &Client{conn: conn}
+	js, _ := c.JetStream()
+	if _, err := js.CreateStream(context.Background(), jetstream.StreamConfig{
+		Name:      "PLATFORM_SMS",
+		Subjects:  []string{"sbi.outbound.nsmsf.>", "platform.sms.delivery.>"},
+		Retention: jetstream.WorkQueuePolicy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ev, _ := smsStreamFor(t, conn, SMSConfig{DeliveryEventSubject: "platform.sms.delivery.event"})
+	if ev.Status != sbiclient.DeliveryDelivered {
+		t.Errorf("status %s, want DELIVERED", ev.Status)
+	}
+	if _, err := js.Stream(context.Background(), sbiclient.StreamSmsfSend); !errors.Is(err, jetstream.ErrStreamNotFound) {
+		t.Errorf("stream %s: %v, want none of the gateway's own", sbiclient.StreamSmsfSend, err)
+	}
+	stream, err := js.Stream(context.Background(), "PLATFORM_SMS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	consumers := stream.ConsumerNames(context.Background())
+	for n := range consumers.Name() {
+		names = append(names, n)
+	}
+	if len(names) != 1 || names[0] != smsConsumerName {
+		t.Errorf("consumers %v, want [%s]", names, smsConsumerName)
+	}
+	info, err := stream.Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Msgs != 1 {
+		t.Errorf("%d messages in the platform's stream, want 1: the delivery event", info.State.Msgs)
 	}
 }

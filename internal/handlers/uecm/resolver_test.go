@@ -44,7 +44,8 @@ func TestNewFromFile_EmptyPath_ReturnsEmpty(t *testing.T) {
 func TestNewFromFile_HappyPath(t *testing.T) {
 	path := writeFile(t, `{
 		"905551234567": {"Supi": "imsi-286010000000001", "SmsfFqdn": "smsf-1.5gc.tr", "SmsfPlmnId": "28601"},
-		"905557654321": {"Supi": "imsi-286010000000002", "SmsfFqdn": "smsf-2.5gc.tr", "SmsfPlmnId": "28601"}
+		"905557654321": {"Supi": "imsi-286010000000002", "SmsfFqdn": "smsf-2.5gc.tr", "SmsfPlmnId": "28601"},
+		"905550000003": {"Supi": "imsi-286010000000003", "smsfInstanceId": "6b2f9c1e-4d3a-4f7b-8e5c-2a9d1f0b3c4e", "SmsfPlmnId": "28601"}
 	}`)
 	r, err := NewFromFile(path)
 	if err != nil {
@@ -56,6 +57,11 @@ func TestNewFromFile_HappyPath(t *testing.T) {
 	}
 	if c.Supi != "imsi-286010000000001" || c.SmsfFqdn != "smsf-1.5gc.tr" {
 		t.Errorf("got %+v", c)
+	}
+	// An SMSF known by its instance ID alone: the gateway discovers it.
+	c, err = r.Resolve(context.Background(), "905550000003")
+	if err != nil || c.SmsfInstanceId != "6b2f9c1e-4d3a-4f7b-8e5c-2a9d1f0b3c4e" || c.SmsfFqdn != "" {
+		t.Errorf("got %+v, %v", c, err)
 	}
 }
 
@@ -78,7 +84,7 @@ func TestNewFromFile_MalformedJSON_FailsAtStartup(t *testing.T) {
 func TestNewFromFile_EntryMissingFields_FailsAtStartup(t *testing.T) {
 	cases := []string{
 		`{"905551234567": {"SmsfFqdn": "y"}}`, // Supi missing
-		`{"905551234567": {"Supi": "x"}}`,     // SmsfFqdn missing
+		`{"905551234567": {"Supi": "x"}}`,     // SmsfFqdn and SmsfInstanceId missing
 	}
 	for _, body := range cases {
 		path := writeFile(t, body)
